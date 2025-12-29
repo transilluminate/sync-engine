@@ -119,12 +119,12 @@ pub mod metrics;
 // Note: We don't expose a `tracing` module to avoid conflict with the tracing crate
 
 pub use config::SyncEngineConfig;
-pub use coordinator::{SyncEngine, EngineState};
+pub use coordinator::{SyncEngine, EngineState, ItemStatus, BatchResult};
 pub use backpressure::BackpressureLevel;
 pub use sync_item::{SyncItem, CrdtSnapshot};
 pub use storage::traits::{CacheStore, ArchiveStore, StorageError};
 pub use cuckoo::filter_manager::{FilterManager, FilterTrust};
-pub use batching::hybrid_batcher::{HybridBatcher, BatchConfig, FlushReason, Batch, FlushBatch, SizedItem};
+pub use batching::hybrid_batcher::{HybridBatcher, BatchConfig, FlushReason, Batch, FlushBatch, SizedItem, BatchableItem};
 pub use merkle::{PathMerkle, MerkleBatch, MerkleNode, RedisMerkleStore};
 pub use resilience::wal::{WriteAheadLog, MysqlHealthChecker, WalStats};
 pub use resilience::circuit_breaker::{CircuitBreaker, CircuitConfig, CircuitError, BackendCircuits};

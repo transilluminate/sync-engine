@@ -233,10 +233,24 @@ impl<T: SizedItem> HybridBatcher<T> {
     }
 }
 
+/// Extension methods for batchable items (have ID for contains check)
+impl<T: BatchableItem> HybridBatcher<T> {
+    /// Check if an item with the given ID is in the pending batch.
+    #[must_use]
+    pub fn contains(&self, id: &str) -> bool {
+        self.batch.items.iter().any(|item| item.id() == id)
+    }
+}
+
 /// Trait for items that know their own size
 pub trait SizedItem {
     #[must_use]
     fn size_bytes(&self) -> usize;
+}
+
+/// Trait for items that have an ID (for contains check)
+pub trait BatchableItem: SizedItem {
+    fn id(&self) -> &str;
 }
 
 #[cfg(test)]

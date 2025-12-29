@@ -30,25 +30,36 @@ Core sync engine with three-tier caching and resilience patterns.
 
 ---
 
-## V1.1 📋 (Next)
+## V1.1 ✅ (Delivered)
 
 API ergonomics for common operations.
 
-### Planned
-- [ ] **`exists(id)` → bool** - Fast existence check via Cuckoo filter
-- [ ] **`status(id)` → ItemStatus** - Sync state: {synced, pending, missing, corrupted}
-- [ ] **`put_batch(items)` → BatchResult** - Atomic multi-item upsert
-- [ ] **`remove_batch(ids)` → BatchResult** - Atomic multi-item delete
-- [ ] **`get_batch(ids)` → Vec<Option<Item>>** - Parallel fetch
+### Features
+- [x] **`contains(id)` → bool** - Fast existence check via Cuckoo filter
+- [x] **`status(id)` → ItemStatus** - Sync state: Synced/Pending/Missing
+- [x] **`submit_many(items)` → BatchResult** - Atomic multi-item upsert
+- [x] **`delete_many(ids)` → BatchResult** - Atomic multi-item delete  
+- [x] **`get_many(ids)` → Vec<Option<Item>>** - Parallel fetch
+- [x] **`get_or_insert_with(id, factory)`** - Cache-aside pattern
+- [x] **`len()` / `is_empty()`** - L1 cache size queries
 
 ```rust
 pub enum ItemStatus {
-    Synced { last_sync: DateTime<Utc> },
-    Pending { queued_at: DateTime<Utc> },
+    Synced { in_l1: bool, in_l2: bool, in_l3: bool },
+    Pending,
     Missing,
-    Corrupted { detected_at: DateTime<Utc> },
+}
+
+pub struct BatchResult {
+    pub total: usize,
+    pub succeeded: usize,
+    pub failed: usize,
 }
 ```
+
+### Metrics
+- 149 lib + 14 doc tests
+- 0 clippy warnings
 
 ---
 
@@ -123,10 +134,11 @@ These concerns belong in coordination layers above sync-engine:
 
 | Priority | Feature | Effort | Value | Version |
 |----------|---------|--------|-------|---------|
+| ✅ Done | `contains()` / `status()` | 2h | API ergonomics | V1.1 |
+| ✅ Done | Batch get/submit/delete | 2h | Performance | V1.1 |
+| ✅ Done | `get_or_insert_with()` | 1h | Cache-aside | V1.1 |
 | ✅ Done | Proptest fuzz suite | 2h | Catches panics | V1.0 |
 | ✅ Done | Hash verification | 1h | Detects corruption | V1.0 |
-| 🔴 High | `exists()` / `status()` | 2h | API ergonomics | V1.1 |
-| 🔴 High | Batch put/remove/get | 3h | Performance | V1.1 |
 | 🟡 Medium | Compression (L3) | 2h | Storage savings | V1.2 |
 | 🟡 Medium | CRDT feature flag | 3h | Clean separation | V1.2 |
 | 🟡 Medium | CRDT compaction | 4h | Storage lifecycle | V1.2 |

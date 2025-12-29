@@ -6,7 +6,7 @@
 use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use crate::batching::hybrid_batcher::SizedItem;
+use crate::batching::hybrid_batcher::{SizedItem, BatchableItem};
 
 /// A wrapper struct that separates metadata from content.
 ///
@@ -125,6 +125,12 @@ impl SizedItem for SyncItem {
                 + self.content.to_string().len()
                 + self.home_instance_id.as_ref().map_or(0, String::len)
         })
+    }
+}
+
+impl BatchableItem for SyncItem {
+    fn id(&self) -> &str {
+        &self.object_id
     }
 }
 
