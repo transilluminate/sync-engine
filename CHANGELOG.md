@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- V1.2 feature flags:
+  - `compression` feature - Transparent zstd compression (level 3, ~70% savings)
+  - `crdt` feature - CRDT-aware compaction using `crdt-data-types` 0.1.3
+- New `src/compression.rs` module:
+  - `compress()` / `decompress()` - zstd with magic-byte auto-detection
+  - `CompressionStats` for ratio/savings tracking
+  - Backwards compatible: `decompress()` handles both compressed and plain JSON
+- New `src/compaction.rs` module:
+  - `CompactionConfig` - retention period (days before compacting to snapshot)
+  - `CompactionPolicy` - KeepAll or MergeCrdt (no delete - preserves rebuild capability)
+  - `CompactionResult` - stats tracking for compaction runs
+  - `crdt_compact::compact_json()` - type-dispatched JSON compaction
+  - `crdt_compact::compact_bytes()` - type-dispatched Cap'n Proto compaction
+
+### Changed
+- Test count: 151 lib + 13 doc tests
+- Coordinator refactored into 5 modules (reduced from 2654 to 2204 lines)
+
+## [0.1.1] - 2024-12-29
+
+### Added
 - V1.1 API ergonomics:
   - `contains(id)` - Fast probabilistic existence check via Cuckoo filters
   - `status(id) -> ItemStatus` - Sync state (Synced/Pending/Missing)

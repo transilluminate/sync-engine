@@ -53,6 +53,8 @@ Sync Engine provides a three-tier caching and persistence architecture optimized
 - **Backpressure**: Six-tier graceful degradation under memory pressure
 - **Circuit Breakers**: Prevent cascade failures to unhealthy backends
 - **Retry Logic**: Configurable exponential backoff for transient failures
+- **CRDT Support**: Optional CRDT-aware compaction with `crdt-data-types` integration
+- **Compression**: Optional transparent zstd compression for L3 storage
 
 ## Quick Start
 
@@ -64,6 +66,19 @@ sync-engine = "0.1"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
+
+### Feature Flags
+
+```toml
+[dependencies]
+sync-engine = { version = "0.1", features = ["compression", "crdt"] }
+```
+
+| Feature | Description |
+|---------|-------------|
+| `compression` | Transparent zstd compression for L3 storage (~70% savings) |
+| `crdt` | CRDT-aware compaction using `crdt-data-types` crate |
+| `otel` | OpenTelemetry trace context propagation |
 
 Basic usage:
 
@@ -158,7 +173,7 @@ cargo test --test integration -- --ignored
 cargo llvm-cov --all-targets -- --include-ignored
 ```
 
-Current coverage: **77%** with 154 tests.
+Current coverage: **77%** with 164 tests (151 lib + 13 doc).
 
 ## Development
 

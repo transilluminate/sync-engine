@@ -63,7 +63,7 @@ pub struct BatchResult {
 
 ---
 
-## V1.2 📋 (Planned)
+## V1.2 ✅ (Delivered)
 
 Compression and CRDT-aware features.
 
@@ -72,29 +72,33 @@ Compression and CRDT-aware features.
 [features]
 default = []
 crdt = ["crdt-data-types"]      # CRDT-aware compaction
-compression = ["zstd"]           # Transparent zstd compression (L3 only)
+compression = ["zstd"]           # Transparent zstd compression
 ```
 
-### Transparent Compression (L3 only)
-Magic-bytes detection with zstd. **Not for Redis** (RediSearch needs plain strings).
+### Features
+- [x] **`compression` feature** - Transparent zstd compression (level 3)
+- [x] **Magic-byte detection** - Auto-detect compressed vs plain JSON on read
+- [x] **`crdt` feature** - Uses `crdt-data-types` 0.1.3 for CRDT semantics
+- [x] **`CompactionConfig`** - Retention period (default 7 days before compacting)
+- [x] **`CompactionPolicy`** - KeepAll or MergeCrdt (no delete - preserves rebuild)
+- [x] **`crdt_compact::compact_json()`** - Type-dispatched JSON compaction
+- [x] **`crdt_compact::compact_bytes()`** - Type-dispatched Cap'n Proto compaction
 
 ```rust
-const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+use sync_engine::compression::{compress, decompress};
+use sync_engine::compaction::{CompactionConfig, crdt_compact};
 
-impl L3Store {
-    pub fn compress(json: &Value) -> Vec<u8> { /* zstd::encode */ }
-    pub fn decompress(bytes: &[u8]) -> Result<Value, Error> {
-        if bytes.starts_with(&ZSTD_MAGIC) { /* zstd */ }
-        else { /* plain JSON */ }
-    }
-}
+// Transparent compression with auto-detect on read
+let compressed = compress(&json_value)?;
+let value = decompress(&bytes)?;  // Works for both compressed and plain
+
+// CRDT compaction (with `crdt` feature)
+let compacted = crdt_compact::compact_json("GCounter", &values)?;
 ```
 
-### CRDT Compaction (with `crdt` feature)
-- Retention policies: `retention_full_days`, `retention_compact_days`
-- Use `crdt-data-types` merge traits for compaction
-- Background compaction job with configurable schedule
-- Preserves CRDT semantics during merge
+### Metrics
+- 151 lib + 13 doc tests
+- 0 clippy warnings
 
 ---
 
@@ -139,9 +143,9 @@ These concerns belong in coordination layers above sync-engine:
 | ✅ Done | `get_or_insert_with()` | 1h | Cache-aside | V1.1 |
 | ✅ Done | Proptest fuzz suite | 2h | Catches panics | V1.0 |
 | ✅ Done | Hash verification | 1h | Detects corruption | V1.0 |
-| 🟡 Medium | Compression (L3) | 2h | Storage savings | V1.2 |
-| 🟡 Medium | CRDT feature flag | 3h | Clean separation | V1.2 |
-| 🟡 Medium | CRDT compaction | 4h | Storage lifecycle | V1.2 |
+| ✅ Done | Compression (zstd) | 2h | Storage savings | V1.2 |
+| ✅ Done | CRDT feature flag | 3h | Clean separation | V1.2 |
+| ✅ Done | CRDT compaction | 4h | Storage lifecycle | V1.2 |
 | 🟢 Nice | CRDT self-healing | 4h | Resilience | V1.3 |
 | 🟢 Nice | Priority sync | 3h | Performance | V1.3 |
 

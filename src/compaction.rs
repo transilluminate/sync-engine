@@ -12,13 +12,17 @@
 //! sync-engine = { version = "0.1", features = ["crdt"] }
 //! ```
 //!
-//! # Retention Policy
+//! # Compaction Model
 //!
-//! CRDTs accumulate operations over time. This module manages storage lifecycle:
+//! CRDTs accumulate operations over time. After the retention period,
+//! operations are merged into a single snapshot per entity:
 //!
-//! - **Full retention** (e.g., 7 days): Keep all operations for replay/audit
-//! - **Compact retention** (e.g., 30 days): Merge operations, keep result
-//! - **Archive** (beyond retention): Delete or move to cold storage
+//! - **Days 0-7** (configurable): Keep all operations for replay/audit
+//! - **Day 7+**: Compact N operations → 1 CRDT snapshot
+//! - **Never delete**: Snapshots preserved for self-healing/rebuild
+//!
+//! This ensures we always have the ability to rebuild state from
+//! the compacted CRDT snapshot if corruption is detected.
 //!
 //! # Example
 //!
@@ -26,8 +30,7 @@
 //! use sync_engine::compaction::{CompactionConfig, CompactionPolicy};
 //!
 //! let config = CompactionConfig {
-//!     retention_full_days: 7,
-//!     retention_compact_days: 30,
+//!     retention_full_days: 7,  // Keep full history for 7 days
 //!     compact_batch_size: 1000,
 //!     ..Default::default()
 //! };
@@ -38,11 +41,10 @@ use std::time::Duration;
 /// Compaction configuration.
 #[derive(Debug, Clone)]
 pub struct CompactionConfig {
-    /// Days to keep full operation history (for replay/audit)
+    /// Days to keep full operation history before compacting.
+    /// After this period, operations are merged into a single CRDT snapshot.
+    /// The snapshot is kept forever (never deleted) to support self-healing.
     pub retention_full_days: u32,
-
-    /// Days to keep compacted snapshots (beyond full retention)
-    pub retention_compact_days: u32,
 
     /// Number of items to process per compaction batch
     pub compact_batch_size: usize,
@@ -58,7 +60,6 @@ impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             retention_full_days: 7,
-            retention_compact_days: 30,
             compact_batch_size: 1000,
             compact_interval: Duration::from_secs(3600), // 1 hour
             compress_compacted: true,
@@ -66,23 +67,20 @@ impl Default for CompactionConfig {
     }
 }
 
-/// Compaction policy for different data types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Compaction policy for CRDT data.
+///
+/// Note: We intentionally don't support "delete" or "keep latest" policies
+/// because they would destroy CRDT semantics and prevent self-healing
+/// from snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompactionPolicy {
-    /// Keep all operations (no compaction)
+    /// Keep all operations indefinitely (no compaction).
+    /// Use for audit trails or when full history is required.
     KeepAll,
-    /// Merge operations using CRDT semantics
+    /// Merge operations using CRDT semantics after retention period.
+    /// This is the recommended policy - compacts N ops → 1 snapshot.
+    #[default]
     MergeCrdt,
-    /// Keep only latest value (overwrite semantics)
-    KeepLatest,
-    /// Delete after retention period
-    DeleteAfterRetention,
-}
-
-impl Default for CompactionPolicy {
-    fn default() -> Self {
-        Self::MergeCrdt
-    }
 }
 
 /// Result of a compaction run.
@@ -90,10 +88,8 @@ impl Default for CompactionPolicy {
 pub struct CompactionResult {
     /// Number of items scanned
     pub scanned: usize,
-    /// Number of items compacted (merged)
+    /// Number of items compacted (N ops → 1 snapshot)
     pub compacted: usize,
-    /// Number of items deleted (expired)
-    pub deleted: usize,
     /// Bytes saved by compaction
     pub bytes_saved: usize,
     /// Duration of compaction run
@@ -104,7 +100,7 @@ impl CompactionResult {
     /// Check if any work was done.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.compacted == 0 && self.deleted == 0
+        self.compacted == 0
     }
 }
 
@@ -225,7 +221,6 @@ mod tests {
     fn test_compaction_config_default() {
         let config = CompactionConfig::default();
         assert_eq!(config.retention_full_days, 7);
-        assert_eq!(config.retention_compact_days, 30);
         assert_eq!(config.compact_batch_size, 1000);
         assert!(config.compress_compacted);
     }

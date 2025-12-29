@@ -102,7 +102,7 @@ impl WriteAheadLog {
         }
         
         // Check file size limit (periodic check - every 100 writes)
-        if pending.is_multiple_of(100) {
+        if pending % 100 == 0 {
             if let Ok(size) = self.file_size_bytes() {
                 if size >= self.max_bytes {
                     return Err(StorageError::Backend(format!(

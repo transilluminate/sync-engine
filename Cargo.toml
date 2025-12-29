@@ -2,6 +2,16 @@
 name = "sync-engine"
 version = "0.1.0"
 edition = "2021"
+authors = ["Adrian Macneil <adrian@example.com>"]
+description = "High-performance tiered sync engine with L1/L2/L3 caching, CRDT support, and zstd compression"
+readme = "README.md"
+license = "AGPL-3.0"
+repository = "https://github.com/adrianmacneil/sync-engine"
+homepage = "https://github.com/adrianmacneil/sync-engine"
+documentation = "https://docs.rs/sync-engine"
+keywords = ["sync", "cache", "crdt", "distributed", "redis"]
+categories = ["caching", "database", "data-structures", "concurrency"]
+rust-version = "1.75"
 
 [features]
 default = []

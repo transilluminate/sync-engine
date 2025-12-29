@@ -369,7 +369,7 @@ impl SyncEngine {
                     loaded += keys.len();
                     offset += keys.len() as u64;
                     
-                    if loaded.is_multiple_of(10_000) || loaded == total_count as usize {
+                    if loaded % 10_000 == 0 || loaded == total_count as usize {
                         debug!(loaded, total = %total_count, "L3 filter warmup progress");
                     }
                 }
