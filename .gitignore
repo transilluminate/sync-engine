@@ -1,0 +1,6 @@
+target/
+config/
+Cargo.lock
+*.rs.bk
+*.log
+.DS_Store
