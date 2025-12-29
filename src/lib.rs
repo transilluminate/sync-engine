@@ -102,6 +102,7 @@
 //! - [`resilience`]: Circuit breakers, retry logic, WAL
 //! - [`eviction`]: Tan-curve eviction policy
 //! - [`backpressure`]: Memory pressure handling
+//! - [`compression`]: Transparent zstd compression (L3 only, feature-gated)
 
 pub mod config;
 pub mod sync_item;
@@ -115,6 +116,12 @@ pub mod merkle;
 pub mod backpressure;
 pub mod coordinator;
 pub mod metrics;
+pub mod compression;
+pub mod compaction;
+
+// Re-export CRDT types when feature enabled
+#[cfg(feature = "crdt")]
+pub use crdt_data_types;
 
 // Note: We don't expose a `tracing` module to avoid conflict with the tracing crate
 
@@ -130,3 +137,9 @@ pub use resilience::wal::{WriteAheadLog, MysqlHealthChecker, WalStats};
 pub use resilience::circuit_breaker::{CircuitBreaker, CircuitConfig, CircuitError, BackendCircuits};
 pub use resilience::retry::RetryConfig;
 pub use metrics::LatencyTimer;
+pub use compression::CompressionError;
+#[cfg(feature = "compression")]
+pub use compression::{compress, decompress, compress_with_stats, CompressionStats};
+pub use compaction::{CompactionConfig, CompactionPolicy, CompactionResult};
+#[cfg(feature = "crdt")]
+pub use compaction::crdt_compact;

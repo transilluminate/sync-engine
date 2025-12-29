@@ -7,6 +7,10 @@ edition = "2021"
 default = []
 # Enable OpenTelemetry trace context propagation helpers
 otel = ["tracing-opentelemetry", "opentelemetry"]
+# Enable CRDT-aware compaction and merge semantics
+crdt = ["dep:crdt-data-types"]
+# Enable transparent zstd compression for L3 storage
+compression = ["dep:zstd"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -31,7 +35,8 @@ parking_lot = "0.12"
 expandable-cuckoo-filter = "0.1"
 
 # From workspace crates (assuming crates.io for now as per brief)
-crdt-data-types = "0.1.2"
+crdt-data-types = { version = "0.1.3", optional = true }
+zstd = { version = "0.13", optional = true }
 redis = { version = "1.0.2", features = ["tokio-comp", "connection-manager"] }
 uuid = { version = "1", features = ["v4"] }
 
