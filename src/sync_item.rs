@@ -43,7 +43,8 @@ pub struct SyncItem {
     pub trace_parent: Option<String>,
     /// W3C Trace Context tracestate header (optional vendor-specific data)
     pub trace_state: Option<String>,
-    /// Calculated value for eviction/sync priority
+    /// Reserved for future use. Currently unused.
+    #[doc(hidden)]
     pub priority_score: f64,
     /// Hash of the content for quick integrity checks
     pub merkle_root: String,

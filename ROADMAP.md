@@ -102,24 +102,6 @@ let compacted = crdt_compact::compact_json("GCounter", &values)?;
 
 ---
 
-## V1.3 📋 (Planned)
-
-Self-healing and performance optimizations.
-
-### CRDT Rebuild from Snapshot
-When corruption detected and `crdt` feature enabled:
-1. Load CRDT snapshot from L3
-2. Re-materialize view using merge semantics
-3. Replace corrupted data transparently
-4. Emit healing metrics
-
-### Priority Sync Queue
-- Sync "hot" items first based on access patterns
-- Multi-tier priority levels (critical/high/normal/low)
-- Configurable priority scoring function
-
----
-
 ## Out of Scope
 
 These concerns belong in coordination layers above sync-engine:
@@ -131,6 +113,8 @@ These concerns belong in coordination layers above sync-engine:
 | **Audit logging** | Separate module with GDPR compliance |
 | **Access control** | Application layer concern |
 | **Rate limiting** | API gateway / coordination layer |
+| **Priority sync** | L1 DashMap already provides instant response; FIFO batching is sufficient |
+| **Auto-healing** | Caller knows CRDT types; we just store opaque JSON |
 
 ---
 
@@ -146,8 +130,6 @@ These concerns belong in coordination layers above sync-engine:
 | ✅ Done | Compression (zstd) | 2h | Storage savings | V1.2 |
 | ✅ Done | CRDT feature flag | 3h | Clean separation | V1.2 |
 | ✅ Done | CRDT compaction | 4h | Storage lifecycle | V1.2 |
-| 🟢 Nice | CRDT self-healing | 4h | Resilience | V1.3 |
-| 🟢 Nice | Priority sync | 3h | Performance | V1.3 |
 
 ---
 

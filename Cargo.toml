@@ -1,13 +1,13 @@
 [package]
 name = "sync-engine"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
-authors = ["Adrian Macneil <adrian@example.com>"]
+authors = ["Adrian Robinson <adrian.j.robinson@gmail.com>"]
 description = "High-performance tiered sync engine with L1/L2/L3 caching, CRDT support, and zstd compression"
 readme = "README.md"
 license = "AGPL-3.0"
-repository = "https://github.com/adrianmacneil/sync-engine"
-homepage = "https://github.com/adrianmacneil/sync-engine"
+repository = "https://github.com/transilluminate/sync-engine"
+homepage = "https://github.com/transilluminate/sync-engine"
 documentation = "https://docs.rs/sync-engine"
 keywords = ["sync", "cache", "crdt", "distributed", "redis"]
 categories = ["caching", "database", "data-structures", "concurrency"]
@@ -32,7 +32,6 @@ tracing-opentelemetry = { version = "0.22", optional = true }
 opentelemetry = { version = "0.21", optional = true }
 metrics = "0.22"
 recloser = "1"
-priority-queue = "2"
 sha2 = "0.10"
 hex = "0.4"
 multihash = "0.19"
