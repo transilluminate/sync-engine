@@ -71,12 +71,6 @@ pub struct SyncEngineConfig {
     #[serde(default = "default_batch_flush_bytes")]
     pub batch_flush_bytes: usize,
     
-    /// CRDT retention
-    #[serde(default = "default_retention_full_days")]
-    pub retention_full_days: u32,
-    #[serde(default = "default_retention_compact_days")]
-    pub retention_compact_days: u32,
-    
     /// Cuckoo filter warmup
     #[serde(default = "default_cuckoo_warmup_batch_size")]
     pub cuckoo_warmup_batch_size: usize,
@@ -100,6 +94,18 @@ pub struct SyncEngineConfig {
     /// CF snapshot after N inserts (0 = disabled)
     #[serde(default = "default_cf_snapshot_insert_threshold")]
     pub cf_snapshot_insert_threshold: u64,
+    
+    /// Redis eviction: enable proactive eviction before Redis LRU kicks in
+    #[serde(default = "default_redis_eviction_enabled")]
+    pub redis_eviction_enabled: bool,
+    
+    /// Redis eviction: pressure threshold to start evicting (0.0-1.0, default: 0.75)
+    #[serde(default = "default_redis_eviction_start")]
+    pub redis_eviction_start: f64,
+    
+    /// Redis eviction: target pressure after eviction (0.0-1.0, default: 0.60)
+    #[serde(default = "default_redis_eviction_target")]
+    pub redis_eviction_target: f64,
 }
 
 fn default_l1_max_bytes() -> usize { 256 * 1024 * 1024 } // 256 MB
@@ -109,12 +115,13 @@ fn default_backpressure_critical() -> f64 { 0.9 }
 fn default_batch_flush_ms() -> u64 { 100 }
 fn default_batch_flush_count() -> usize { 1000 }
 fn default_batch_flush_bytes() -> usize { 1024 * 1024 } // 1 MB
-fn default_retention_full_days() -> u32 { 7 }
-fn default_retention_compact_days() -> u32 { 90 }
 fn default_cuckoo_warmup_batch_size() -> usize { 10000 }
 fn default_wal_drain_batch_size() -> usize { 100 }
 fn default_cf_snapshot_interval_secs() -> u64 { 30 }
 fn default_cf_snapshot_insert_threshold() -> u64 { 10_000 }
+fn default_redis_eviction_enabled() -> bool { true }
+fn default_redis_eviction_start() -> f64 { 0.75 }
+fn default_redis_eviction_target() -> f64 { 0.60 }
 
 impl Default for SyncEngineConfig {
     fn default() -> Self {
@@ -129,14 +136,15 @@ impl Default for SyncEngineConfig {
             batch_flush_ms: default_batch_flush_ms(),
             batch_flush_count: default_batch_flush_count(),
             batch_flush_bytes: default_batch_flush_bytes(),
-            retention_full_days: default_retention_full_days(),
-            retention_compact_days: default_retention_compact_days(),
             cuckoo_warmup_batch_size: default_cuckoo_warmup_batch_size(),
             wal_path: None,
             wal_max_items: None,
             wal_drain_batch_size: default_wal_drain_batch_size(),
             cf_snapshot_interval_secs: default_cf_snapshot_interval_secs(),
             cf_snapshot_insert_threshold: default_cf_snapshot_insert_threshold(),
+            redis_eviction_enabled: default_redis_eviction_enabled(),
+            redis_eviction_start: default_redis_eviction_start(),
+            redis_eviction_target: default_redis_eviction_target(),
         }
     }
 }

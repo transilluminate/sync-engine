@@ -17,22 +17,50 @@ const MERKLE_CHILDREN_PREFIX: &str = "merkle:children:";
 /// Redis-backed Merkle tree storage.
 ///
 /// Uses two key patterns:
-/// - `merkle:hash:{prefix}` -> 32-byte hash (string, hex-encoded)
-/// - `merkle:children:{prefix}` -> sorted set of `segment:hash` pairs
+/// - `{prefix}merkle:hash:{path}` -> 32-byte hash (string, hex-encoded)
+/// - `{prefix}merkle:children:{path}` -> sorted set of `segment:hash` pairs
+///
+/// The optional prefix enables namespacing when sharing Redis with other apps.
 #[derive(Clone)]
 pub struct RedisMerkleStore {
     conn: ConnectionManager,
+    /// Optional key prefix for namespacing (e.g., "myapp:" → "myapp:merkle:hash:...")
+    prefix: String,
 }
 
 impl RedisMerkleStore {
+    /// Create a new merkle store without a prefix.
     pub fn new(conn: ConnectionManager) -> Self {
-        Self { conn }
+        Self::with_prefix(conn, None)
+    }
+    
+    /// Create a new merkle store with an optional prefix.
+    pub fn with_prefix(conn: ConnectionManager, prefix: Option<&str>) -> Self {
+        Self { 
+            conn,
+            prefix: prefix.unwrap_or("").to_string(),
+        }
+    }
+    
+    /// Build the full key with prefix.
+    #[inline]
+    fn prefixed_key(&self, suffix: &str) -> String {
+        if self.prefix.is_empty() {
+            suffix.to_string()
+        } else {
+            format!("{}{}", self.prefix, suffix)
+        }
+    }
+    
+    /// Get the prefix used for all merkle keys.
+    pub fn key_prefix(&self) -> &str {
+        &self.prefix
     }
 
     /// Get the hash for a prefix (interior node or leaf).
     #[instrument(skip(self))]
-    pub async fn get_hash(&self, prefix: &str) -> Result<Option<[u8; 32]>, StorageError> {
-        let key = format!("{}{}", MERKLE_HASH_PREFIX, prefix);
+    pub async fn get_hash(&self, path: &str) -> Result<Option<[u8; 32]>, StorageError> {
+        let key = self.prefixed_key(&format!("{}{}", MERKLE_HASH_PREFIX, path));
         let mut conn = self.conn.clone();
         
         let result: Option<String> = conn.get(&key).await.map_err(|e| {
@@ -62,9 +90,9 @@ impl RedisMerkleStore {
     #[instrument(skip(self))]
     pub async fn get_children(
         &self,
-        prefix: &str,
+        path: &str,
     ) -> Result<BTreeMap<String, [u8; 32]>, StorageError> {
-        let key = format!("{}{}", MERKLE_CHILDREN_PREFIX, prefix);
+        let key = self.prefixed_key(&format!("{}{}", MERKLE_CHILDREN_PREFIX, path));
         let mut conn = self.conn.clone();
         
         // ZRANGE returns members as strings
@@ -128,7 +156,7 @@ impl RedisMerkleStore {
 
         // Step 1: Apply leaf updates
         for (object_id, maybe_hash) in &batch.leaves {
-            let hash_key = format!("{}{}", MERKLE_HASH_PREFIX, object_id);
+            let hash_key = self.prefixed_key(&format!("{}{}", MERKLE_HASH_PREFIX, object_id));
             
             match maybe_hash {
                 Some(hash) => {
@@ -172,10 +200,13 @@ impl RedisMerkleStore {
         
         // Use SCAN instead of KEYS to avoid blocking Redis
         let scan_pattern = if prefix.is_empty() {
-            format!("{}*", MERKLE_HASH_PREFIX)
+            self.prefixed_key(&format!("{}*", MERKLE_HASH_PREFIX))
         } else {
-            format!("{}{}.*", MERKLE_HASH_PREFIX, prefix)
+            self.prefixed_key(&format!("{}{}.*", MERKLE_HASH_PREFIX, prefix))
         };
+        
+        // For stripping keys later, we need the full prefix
+        let full_hash_prefix = self.prefixed_key(MERKLE_HASH_PREFIX);
         
         let mut keys: Vec<String> = Vec::new();
         let mut cursor = 0u64;
@@ -203,7 +234,7 @@ impl RedisMerkleStore {
         
         for key in &keys {
             // Extract the path from the key
-            let path: &str = key.strip_prefix(MERKLE_HASH_PREFIX).unwrap_or(key.as_str());
+            let path: &str = key.strip_prefix(&full_hash_prefix).unwrap_or(key.as_str());
             
             // Check if this is a direct child
             let suffix: &str = if prefix.is_empty() {
@@ -243,8 +274,8 @@ impl RedisMerkleStore {
         let hash_hex = hex::encode(node.hash);
         
         // Update hash and children set
-        let hash_key = format!("{}{}", MERKLE_HASH_PREFIX, prefix);
-        let children_key = format!("{}{}", MERKLE_CHILDREN_PREFIX, prefix);
+        let hash_key = self.prefixed_key(&format!("{}{}", MERKLE_HASH_PREFIX, prefix));
+        let children_key = self.prefixed_key(&format!("{}{}", MERKLE_CHILDREN_PREFIX, prefix));
         
         let mut pipe = redis::pipe();
         pipe.atomic();
@@ -272,7 +303,7 @@ impl RedisMerkleStore {
         self.recompute_interior_node("").await?;
         
         // Root hash is stored at ""
-        let key = MERKLE_HASH_PREFIX.to_string();
+        let key = self.prefixed_key(MERKLE_HASH_PREFIX);
         let mut conn = self.conn.clone();
         
         let result: Option<String> = conn.get(&key).await.map_err(|e| {

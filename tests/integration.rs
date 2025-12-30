@@ -33,9 +33,9 @@ use testcontainers::{clients::Cli, Container, GenericImage, core::WaitFor};
 // Container Helpers
 // =============================================================================
 
-/// Create a Redis container with health check
+/// Create a Redis Stack container with RedisJSON + RediSearch modules
 fn redis_container(docker: &Cli) -> Container<'_, GenericImage> {
-    let image = GenericImage::new("redis", "7-alpine")
+    let image = GenericImage::new("redis/redis-stack-server", "latest")
         .with_exposed_port(6379)
         .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"));
     docker.run(image)
@@ -1098,4 +1098,140 @@ async fn coverage_engine_state_transitions() {
     let _ = state_rx.changed().await;
 
     let _ = std::fs::remove_file(&wal_path);
+}
+
+// =============================================================================
+// Coverage Gap Tests - Redis JSON Paths & Prefix Support
+// =============================================================================
+
+#[tokio::test]
+#[ignore] // Requires Docker (Redis Stack)
+async fn coverage_redis_json_storage() {
+    // Tests RedisJSON storage paths (JSON.SET/JSON.GET) with Redis Stack
+    let docker = Cli::default();
+    let redis = redis_container(&docker);
+    let redis_port = redis.get_host_port_ipv4(6379);
+    
+    let wal_path = unique_wal_path("redis_json");
+    let config = SyncEngineConfig {
+        redis_url: Some(format!("redis://127.0.0.1:{}", redis_port)),
+        redis_prefix: Some("test:".to_string()),
+        sql_url: None,
+        batch_flush_ms: 50,
+        batch_flush_count: 2,
+        wal_path: Some(wal_path.clone()),
+        ..Default::default()
+    };
+
+    let (_tx, rx) = watch::channel(config.clone());
+    let mut engine = SyncEngine::new(config, rx);
+    engine.start().await.expect("Start failed");
+
+    // Submit JSON items - these should go through JSON.SET path
+    let items = vec![
+        ("user.alice", json!({"name": "Alice", "role": "admin", "requests": 42000})),
+        ("user.bob", json!({"name": "Bob", "role": "user", "requests": 100})),
+        ("config.app", json!({"debug": false, "version": "1.0.0"})),
+    ];
+
+    for (id, payload) in &items {
+        let item = SyncItem::from_json(id.to_string(), payload.clone());
+        engine.submit(item).await.expect("Submit failed");
+    }
+
+    // Force flush to Redis
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    engine.force_flush().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Verify items are retrievable (L1 hit first, proving data integrity)
+    for (id, expected_payload) in &items {
+        let item = engine.get(id).await
+            .expect("Get failed")
+            .expect("Item should exist");
+        
+        assert_eq!(item.object_id, *id);
+        let payload = item.content_as_json().expect("Should be JSON");
+        assert_eq!(&payload, expected_payload);
+    }
+    
+    // Verify data actually went to Redis with proper JSON structure
+    // by checking raw Redis keys have the prefix
+    let client = redis::Client::open(format!("redis://127.0.0.1:{}", redis_port)).unwrap();
+    let mut conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+    
+    // Check that prefixed keys exist
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg("test:user.*")
+        .query_async(&mut conn)
+        .await
+        .expect("KEYS failed");
+    
+    assert!(!keys.is_empty(), "Should have test:user.* keys in Redis");
+    
+    // Verify it's stored as RedisJSON (key type should be ReJSON-RL)
+    for key in &keys {
+        let key_type: String = redis::cmd("TYPE")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .expect("TYPE failed");
+        assert_eq!(key_type, "ReJSON-RL", "Key {} should be RedisJSON type", key);
+    }
+
+    engine.shutdown().await;
+    let _ = std::fs::remove_file(&wal_path);
+}
+
+#[tokio::test]
+#[ignore] // Requires Docker (Redis Stack)
+async fn coverage_merkle_with_prefix() {
+    // Tests that Merkle store respects redis_prefix
+    use sync_engine::merkle::RedisMerkleStore;
+    use redis::Client;
+    
+    let docker = Cli::default();
+    let redis = redis_container(&docker);
+    let redis_port = redis.get_host_port_ipv4(6379);
+    let redis_url = format!("redis://127.0.0.1:{}", redis_port);
+    
+    // Create merkle store WITH prefix
+    let client = Client::open(redis_url.as_str()).expect("Redis client failed");
+    let conn = redis::aio::ConnectionManager::new(client).await.expect("Connection failed");
+    let merkle = RedisMerkleStore::with_prefix(conn.clone(), Some("myapp:"));
+    
+    // Apply a batch
+    use sync_engine::merkle::{MerkleBatch, PathMerkle};
+    let mut batch = MerkleBatch::new();
+    let hash = PathMerkle::leaf_hash("user.test", 1, 12345, &[0u8; 32]);
+    batch.insert("user.test".to_string(), hash);
+    
+    merkle.apply_batch(&batch).await.expect("Apply batch failed");
+    
+    // Verify the key has the prefix using raw Redis commands
+    let mut raw_conn = conn.clone();
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg("myapp:merkle:*")
+        .query_async(&mut raw_conn)
+        .await
+        .expect("KEYS failed");
+    
+    assert!(!keys.is_empty(), "Merkle keys should have myapp: prefix");
+    for key in &keys {
+        assert!(key.starts_with("myapp:merkle:"), "Key {} should start with myapp:merkle:", key);
+    }
+    
+    // Verify NO unprefixed keys exist
+    let unprefixed: Vec<String> = redis::cmd("KEYS")
+        .arg("merkle:*")
+        .query_async(&mut raw_conn)
+        .await
+        .expect("KEYS failed");
+    
+    // Filter out the prefixed ones
+    let truly_unprefixed: Vec<_> = unprefixed.iter()
+        .filter(|k| !k.starts_with("myapp:"))
+        .collect();
+    
+    assert!(truly_unprefixed.is_empty(), "Should have no unprefixed merkle keys: {:?}", truly_unprefixed);
 }

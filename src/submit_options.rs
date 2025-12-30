@@ -12,8 +12,8 @@
 //! // Default: store in both Redis and SQL
 //! let default_opts = SubmitOptions::default();
 //!
-//! // CRDT snapshot (SQL only for durability)
-//! let crdt_opts = SubmitOptions::durable();
+//! // Durable storage (SQL only, skip Redis cache)
+//! let durable_opts = SubmitOptions::durable();
 //!
 //! // Ephemeral cache (Redis only with TTL)
 //! let cache_opts = SubmitOptions::cache(CacheTtl::Hour);

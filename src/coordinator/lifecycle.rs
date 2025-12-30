@@ -169,7 +169,10 @@ impl SyncEngine {
             info!(url = %redis_url, prefix = ?self.config.redis_prefix, "Connecting to Redis (L2 - cache)...");
             match crate::storage::redis::RedisStore::with_prefix(redis_url, self.config.redis_prefix.as_deref()).await {
                 Ok(store) => {
-                    let redis_merkle = RedisMerkleStore::new(store.connection());
+                    let redis_merkle = RedisMerkleStore::with_prefix(
+                        store.connection(),
+                        self.config.redis_prefix.as_deref(),
+                    );
                     self.redis_merkle = Some(redis_merkle);
                     self.l2_store = Some(std::sync::Arc::new(store));
                     tracing::Span::current().record("has_redis", true);

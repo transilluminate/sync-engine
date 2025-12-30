@@ -159,22 +159,25 @@ let custom = SubmitOptions {
 
 ## Testing
 
-Comprehensive test suite with 211 tests covering unit, property-based, integration, and chaos testing:
+Comprehensive test suite with 218 tests covering unit, property-based, integration, and chaos testing:
 
 | Test Suite | Count | Description |
 |------------|-------|-------------|
-| **Unit Tests** | 150 | Fast, no external deps |
+| **Unit Tests** | 154 | Fast, no external deps |
+| **Doc Tests** | 20 | Example verification |
 | **Property Tests** | 12 | Proptest fuzzing for invariants |
-| **Integration Tests** | 20 | Real Redis/MySQL via testcontainers |
+| **Integration Tests** | 22 | Real Redis Stack/MySQL via testcontainers |
 | **Chaos Tests** | 10 | Failure injection, container killing |
-| **Doc Tests** | 19 | Example verification |
-| **Total** | **211** | ~78% code coverage |
+| **Total** | **218** | ~74% code coverage |
 
 ### Running Tests
 
 ```bash
 # Unit tests (fast, no Docker)
 cargo test --lib
+
+# Doc tests (not so fast, no Docker)
+cargo test --doc
 
 # Property-based fuzzing
 cargo test --test proptest_fuzz
@@ -187,6 +190,9 @@ cargo test --test chaos -- --ignored
 
 # All tests
 cargo test -- --include-ignored
+
+# Coverage (slow, requires Docker for integration and chaos)
+cargo llvm-cov --all-features --lib --tests -- --include-ignored
 ```
 
 ## Examples & CLI Tools
@@ -279,3 +285,5 @@ The chaos test suite validates resilience under real-world failure conditions:
 ## License
 
 [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0)
+
+For commercial licensing options, contact: adrian.j.robinson@gmail.com

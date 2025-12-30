@@ -125,7 +125,7 @@ pub struct SyncItem {
     /// W3C Trace Context traceparent header (for cross-item trace linking)
     /// Format: "00-{trace_id}-{span_id}-{flags}"
     /// This is NOT for in-process tracing (that flows via Span::current()),
-    /// but for linking CRDT merge operations across items/time.
+    /// but for linking related operations across items/time.
     pub trace_parent: Option<String>,
     /// W3C Trace Context tracestate header (optional vendor-specific data)
     pub trace_state: Option<String>,
@@ -280,7 +280,7 @@ impl SyncItem {
         serde_json::from_slice(&self.content).ok()
     }
 
-    /// Attach trace context from current span (for CRDT merge DAG linking)
+    /// Attach trace context from current span (for distributed trace linking)
     #[cfg(feature = "otel")]
     pub fn with_current_trace_context(mut self) -> Self {
         use opentelemetry::trace::TraceContextExt;
@@ -299,14 +299,6 @@ impl SyncItem {
         }
         self
     }
-}
-
-/// A wrapper around a compacted CRDT.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CrdtSnapshot {
-    // TODO: Define structure based on crdt-data-types
-    pub id: String,
-    pub payload: Vec<u8>,
 }
 
 impl SizedItem for SyncItem {
@@ -471,24 +463,6 @@ mod tests {
         
         assert!(debug_str.contains("SyncItem"));
         assert!(debug_str.contains("test"));
-    }
-
-    #[test]
-    fn test_crdt_snapshot() {
-        let snapshot = CrdtSnapshot {
-            id: "snap-1".to_string(),
-            payload: vec![1, 2, 3, 4, 5],
-        };
-        
-        assert_eq!(snapshot.id, "snap-1");
-        assert_eq!(snapshot.payload.len(), 5);
-        
-        // Test serialization
-        let json_str = serde_json::to_string(&snapshot).unwrap();
-        let deserialized: CrdtSnapshot = serde_json::from_str(&json_str).unwrap();
-        
-        assert_eq!(deserialized.id, snapshot.id);
-        assert_eq!(deserialized.payload, snapshot.payload);
     }
 
     #[test]

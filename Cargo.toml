@@ -37,6 +37,7 @@ async-trait = "0.1"
 expandable-cuckoo-filter = "0.1"
 redis = { version = "1.0.2", features = ["tokio-comp", "connection-manager"] }
 uuid = { version = "1", features = ["v4"] }
+parking_lot = "0.12"
 
 [dev-dependencies]
 proptest = "1"
