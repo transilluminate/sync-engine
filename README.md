@@ -163,12 +163,12 @@ Comprehensive test suite with 218 tests covering unit, property-based, integrati
 
 | Test Suite | Count | Description |
 |------------|-------|-------------|
-| **Unit Tests** | 154 | Fast, no external deps |
+| **Unit Tests** | 155 | Fast, no external deps |
 | **Doc Tests** | 20 | Example verification |
 | **Property Tests** | 12 | Proptest fuzzing for invariants |
 | **Integration Tests** | 22 | Real Redis Stack/MySQL via testcontainers |
 | **Chaos Tests** | 10 | Failure injection, container killing |
-| **Total** | **218** | ~74% code coverage |
+| **Total** | **219** | ~74% code coverage |
 
 ### Running Tests
 

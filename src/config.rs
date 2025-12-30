@@ -106,6 +106,21 @@ pub struct SyncEngineConfig {
     /// Redis eviction: target pressure after eviction (0.0-1.0, default: 0.60)
     #[serde(default = "default_redis_eviction_target")]
     pub redis_eviction_target: f64,
+    
+    /// Merkle calculation: enable merkle tree updates on this instance.
+    /// 
+    /// In a multi-instance deployment with shared SQL, only a few nodes need to
+    /// run merkle calculations for resilience. Set to false on most nodes.
+    /// Default: true (single-instance default)
+    #[serde(default = "default_merkle_calc_enabled")]
+    pub merkle_calc_enabled: bool,
+    
+    /// Merkle calculation: jitter range in milliseconds.
+    /// 
+    /// Adds random delay (0 to N ms) before merkle batch calculation to reduce
+    /// contention when multiple instances are calculating. Default: 0 (no jitter)
+    #[serde(default)]
+    pub merkle_calc_jitter_ms: u64,
 }
 
 fn default_l1_max_bytes() -> usize { 256 * 1024 * 1024 } // 256 MB
@@ -122,6 +137,7 @@ fn default_cf_snapshot_insert_threshold() -> u64 { 10_000 }
 fn default_redis_eviction_enabled() -> bool { true }
 fn default_redis_eviction_start() -> f64 { 0.75 }
 fn default_redis_eviction_target() -> f64 { 0.60 }
+fn default_merkle_calc_enabled() -> bool { true }
 
 impl Default for SyncEngineConfig {
     fn default() -> Self {
@@ -145,6 +161,8 @@ impl Default for SyncEngineConfig {
             redis_eviction_enabled: default_redis_eviction_enabled(),
             redis_eviction_start: default_redis_eviction_start(),
             redis_eviction_target: default_redis_eviction_target(),
+            merkle_calc_enabled: default_merkle_calc_enabled(),
+            merkle_calc_jitter_ms: 0,
         }
     }
 }

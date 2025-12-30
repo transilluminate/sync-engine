@@ -123,7 +123,7 @@ pub mod metrics;
 // Note: We don't expose a `tracing` module to avoid conflict with the tracing crate
 
 pub use config::SyncEngineConfig;
-pub use coordinator::{SyncEngine, EngineState, ItemStatus, BatchResult};
+pub use coordinator::{SyncEngine, EngineState, ItemStatus, BatchResult, MerkleDiff};
 pub use backpressure::BackpressureLevel;
 pub use sync_item::{SyncItem, ContentType};
 pub use submit_options::{CacheTtl, OptionsKey, SubmitOptions};

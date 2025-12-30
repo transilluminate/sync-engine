@@ -11,13 +11,13 @@ echo ""
 # Clear Redis
 # ─────────────────────────────────────────────────────────────────────────────
 echo "📦 Redis (localhost:6379)"
-KEYS_BEFORE=$(redis-cli DBSIZE | awk '{print $2}')
+KEYS_BEFORE=$(redis-cli DBSIZE)
 echo "   └─ Keys before: $KEYS_BEFORE"
 
 redis-cli FLUSHDB > /dev/null
 echo "   └─ ✅ FLUSHDB complete!"
 
-KEYS_AFTER=$(redis-cli DBSIZE | awk '{print $2}')
+KEYS_AFTER=$(redis-cli DBSIZE)
 echo "   └─ Keys after: $KEYS_AFTER"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -32,21 +32,7 @@ echo "   └─ Rows before: $ROWS_BEFORE"
 docker exec mysql mysql -utest -ptest -e "DROP TABLE IF EXISTS sync_items" test 2>/dev/null
 echo "   └─ ✅ Table dropped!"
 
-docker exec mysql mysql -utest -ptest -e "
-CREATE TABLE IF NOT EXISTS sync_items (
-    id VARCHAR(255) PRIMARY KEY,
-    version BIGINT NOT NULL,
-    timestamp BIGINT NOT NULL,
-    payload_hash VARCHAR(64),
-    payload LONGTEXT,
-    payload_blob MEDIUMBLOB,
-    audit TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-)" test 2>/dev/null
-echo "   └─ ✅ Table recreated!"
-
-ROWS_AFTER=$(docker exec mysql mysql -utest -ptest -N -e "SELECT COUNT(*) FROM sync_items" test 2>/dev/null)
+ROWS_AFTER=$(docker exec mysql mysql -utest -ptest -N -e "SELECT COUNT(*) FROM sync_items" test 2>/dev/null || echo "0")
 echo "   └─ Rows after: $ROWS_AFTER"
 
 echo ""

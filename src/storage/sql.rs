@@ -87,6 +87,9 @@ impl SqlStore {
         // Note: We use TEXT/LONGTEXT instead of native JSON type because sqlx's
         // `Any` driver doesn't support MySQL's JSON type mapping. The data is still
         // valid JSON and can be queried with JSON_EXTRACT() in MySQL.
+        //
+        // merkle_dirty: Set to 1 on write, background task sets to 0 after merkle recalc.
+        // This enables efficient multi-instance coordination without locking.
         let sql = if self.is_sqlite {
             r#"
             CREATE TABLE IF NOT EXISTS sync_items (
@@ -96,7 +99,8 @@ impl SqlStore {
                 payload_hash TEXT,
                 payload TEXT,
                 payload_blob BLOB,
-                audit TEXT
+                audit TEXT,
+                merkle_dirty INTEGER NOT NULL DEFAULT 1
             )
             "#
         } else {
@@ -111,7 +115,9 @@ impl SqlStore {
                 payload LONGTEXT,
                 payload_blob MEDIUMBLOB,
                 audit TEXT,
-                INDEX idx_timestamp (timestamp)
+                merkle_dirty TINYINT NOT NULL DEFAULT 1,
+                INDEX idx_timestamp (timestamp),
+                INDEX idx_merkle_dirty (merkle_dirty)
             )
             "#
         };
@@ -252,25 +258,27 @@ impl ArchiveStore for SqlStore {
         };
 
         let sql = if self.is_sqlite {
-            "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit) 
-             VALUES (?, ?, ?, ?, ?, ?, ?) 
+            "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, 1) 
              ON CONFLICT(id) DO UPDATE SET 
                 version = excluded.version, 
                 timestamp = excluded.timestamp, 
                 payload_hash = excluded.payload_hash, 
                 payload = excluded.payload, 
                 payload_blob = excluded.payload_blob, 
-                audit = excluded.audit"
+                audit = excluded.audit, 
+                merkle_dirty = 1"
         } else {
-            "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit) 
-             VALUES (?, ?, ?, ?, ?, ?, ?) 
+            "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, 1) 
              ON DUPLICATE KEY UPDATE 
                 version = VALUES(version), 
                 timestamp = VALUES(timestamp), 
                 payload_hash = VALUES(payload_hash), 
                 payload = VALUES(payload), 
                 payload_blob = VALUES(payload_blob), 
-                audit = VALUES(audit)"
+                audit = VALUES(audit), 
+                merkle_dirty = 1"
         };
 
         retry("sql_put", &RetryConfig::query(), || async {
@@ -399,31 +407,33 @@ impl SqlStore {
     /// The batch_id is already embedded in each item's audit JSON.
     async fn put_batch_chunk(&self, chunk: &[SyncItem], _batch_id: &str) -> Result<usize, StorageError> {
         let placeholders: Vec<String> = (0..chunk.len())
-            .map(|_| "(?, ?, ?, ?, ?, ?, ?)".to_string())
+            .map(|_| "(?, ?, ?, ?, ?, ?, ?, 1)".to_string())
             .collect();
         
         let sql = if self.is_sqlite {
             format!(
-                "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit) VALUES {} \
+                "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty) VALUES {} \
                  ON CONFLICT(id) DO UPDATE SET \
                     version = excluded.version, \
                     timestamp = excluded.timestamp, \
                     payload_hash = excluded.payload_hash, \
                     payload = excluded.payload, \
                     payload_blob = excluded.payload_blob, \
-                    audit = excluded.audit",
+                    audit = excluded.audit, \
+                    merkle_dirty = 1",
                 placeholders.join(", ")
             )
         } else {
             format!(
-                "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit) VALUES {} \
+                "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty) VALUES {} \
                  ON DUPLICATE KEY UPDATE \
                     version = VALUES(version), \
                     timestamp = VALUES(timestamp), \
                     payload_hash = VALUES(payload_hash), \
                     payload = VALUES(payload), \
                     payload_blob = VALUES(payload_blob), \
-                    audit = VALUES(audit)",
+                    audit = VALUES(audit), \
+                    merkle_dirty = 1",
                 placeholders.join(", ")
             )
         };
@@ -603,5 +613,141 @@ impl SqlStore {
             }
         })
         .await
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Merkle Dirty Flag: For deferred merkle calculation in multi-instance setups
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Get IDs of items with merkle_dirty = 1 (need merkle recalculation).
+    ///
+    /// Used by background merkle processor to batch recalculate affected trees.
+    pub async fn get_dirty_merkle_ids(&self, limit: usize) -> Result<Vec<String>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT id FROM sync_items WHERE merkle_dirty = 1 LIMIT ?"
+        )
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Backend(format!("Failed to get dirty merkle ids: {}", e)))?;
+        
+        let mut ids = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get("id")
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            ids.push(id);
+        }
+        
+        Ok(ids)
+    }
+    
+    /// Count items with merkle_dirty = 1.
+    pub async fn count_dirty_merkle(&self) -> Result<u64, StorageError> {
+        let result = sqlx::query("SELECT COUNT(*) as cnt FROM sync_items WHERE merkle_dirty = 1")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        
+        let count: i64 = result.try_get("cnt")
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        
+        Ok(count as u64)
+    }
+    
+    /// Mark items as merkle-clean after recalculation.
+    pub async fn mark_merkle_clean(&self, ids: &[String]) -> Result<usize, StorageError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        
+        let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
+        let sql = format!(
+            "UPDATE sync_items SET merkle_dirty = 0 WHERE id IN ({})",
+            placeholders.join(", ")
+        );
+        
+        let mut query = sqlx::query(&sql);
+        for id in ids {
+            query = query.bind(id);
+        }
+        
+        let result = query.execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        
+        Ok(result.rows_affected() as usize)
+    }
+    
+    /// Check if there are any dirty merkle items.
+    pub async fn has_dirty_merkle(&self) -> Result<bool, StorageError> {
+        let result = sqlx::query("SELECT 1 FROM sync_items WHERE merkle_dirty = 1 LIMIT 1")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        
+        Ok(result.is_some())
+    }
+    
+    /// Get full SyncItems with merkle_dirty = 1 (need merkle recalculation).
+    ///
+    /// Returns the items themselves so merkle can be calculated.
+    /// Use `mark_merkle_clean()` after processing to clear the flag.
+    pub async fn get_dirty_merkle_items(&self, limit: usize) -> Result<Vec<SyncItem>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT id, version, timestamp, payload_hash, payload, payload_blob, audit 
+             FROM sync_items WHERE merkle_dirty = 1 LIMIT ?"
+        )
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Backend(format!("Failed to get dirty merkle items: {}", e)))?;
+        
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get("id")
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            let version: i64 = row.try_get("version").unwrap_or(1);
+            let timestamp: i64 = row.try_get("timestamp").unwrap_or(0);
+            let payload_hash: Option<String> = row.try_get("payload_hash").ok();
+            
+            // Handle JSON payload (MySQL returns as bytes, SQLite as string)
+            let payload_bytes: Option<Vec<u8>> = row.try_get("payload").ok();
+            let payload_json: Option<String> = payload_bytes.and_then(|bytes| {
+                String::from_utf8(bytes).ok()
+            });
+            
+            let payload_blob: Option<Vec<u8>> = row.try_get("payload_blob").ok();
+            let audit_bytes: Option<Vec<u8>> = row.try_get("audit").ok();
+            let audit_json: Option<String> = audit_bytes.and_then(|bytes| {
+                String::from_utf8(bytes).ok()
+            });
+            
+            // Determine content and content_type
+            let (content, content_type) = if let Some(ref json_str) = payload_json {
+                (json_str.as_bytes().to_vec(), ContentType::Json)
+            } else if let Some(blob) = payload_blob {
+                (blob, ContentType::Binary)
+            } else {
+                continue; // Skip items with no payload
+            };
+            
+            // Parse audit fields
+            let (batch_id, trace_parent, home_instance_id) = Self::parse_audit_json(audit_json);
+            
+            let item = SyncItem::reconstruct(
+                id,
+                version as u64,
+                timestamp,
+                content_type,
+                content,
+                batch_id,
+                trace_parent,
+                payload_hash.unwrap_or_default(),
+                home_instance_id,
+            );
+            items.push(item);
+        }
+        
+        Ok(items)
     }
 }

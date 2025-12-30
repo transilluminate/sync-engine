@@ -14,16 +14,30 @@ echo ""
 echo "🔍 RediSearch Query: $QUERY"
 echo ""
 
-# Check if index exists
-if ! redis-cli FT.INFO sync_idx > /dev/null 2>&1; then
+# Check if index exists (redis-cli returns error text, not exit code)
+INDEX_CHECK=$(redis-cli FT.INFO sync_idx 2>&1)
+if echo "$INDEX_CHECK" | grep -q "Unknown index name\|no such index\|ERR"; then
     echo "❌ Index 'sync_idx' not found!"
     echo "   └─ Run: ./scripts/redisearch-index.sh"
     exit 1
 fi
 
 # Execute search and get results
-RESULT=$(redis-cli FT.SEARCH sync_idx "$QUERY" LIMIT 0 100)
+RESULT=$(redis-cli FT.SEARCH sync_idx "$QUERY" LIMIT 0 100 2>&1)
+
+# Check for search errors (e.g., bad query syntax)
+if echo "$RESULT" | grep -q "ERR\|no such index"; then
+    echo "❌ Search error: $RESULT"
+    exit 1
+fi
+
 COUNT=$(echo "$RESULT" | head -1)
+
+# Validate COUNT is a number
+if ! [[ "$COUNT" =~ ^[0-9]+$ ]]; then
+    echo "❌ Unexpected result: $COUNT"
+    exit 1
+fi
 
 echo "📊 Found $COUNT result(s)"
 echo ""

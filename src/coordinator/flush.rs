@@ -165,7 +165,6 @@ impl SyncEngine {
         let mut total_l3_success = 0;
         let mut total_l3_bytes = 0usize;
         let mut total_wal_fallback = 0;
-        let mut all_items: Vec<SyncItem> = Vec::with_capacity(batch_size);
         
         for (options_key, mut items) in groups {
             let options = options_key.to_options();
@@ -251,43 +250,87 @@ impl SyncEngine {
                 }
             }
             
-            // Collect items for Merkle update
-            all_items.extend(items);
+            // No need to collect items for Merkle anymore - we use dirty flag in SQL
         }
         
-        // ====== Merkle: Compute and update hashes (for ALL items) ======
-        let mut merkle_batch = MerkleBatch::new();
-        
-        for item in &all_items {
-            let payload_hash = PathMerkle::payload_hash(&item.content);
-            let leaf_hash = PathMerkle::leaf_hash(
-                &item.object_id,
-                item.version,
-                item.updated_at,
-                &payload_hash,
-            );
-            merkle_batch.insert(item.object_id.clone(), leaf_hash);
-        }
-        
-        if !merkle_batch.is_empty() {
-            if let Some(ref sql_merkle) = self.sql_merkle {
-                if let Err(e) = sql_merkle.apply_batch(&merkle_batch).await {
-                    error!(error = %e, "Failed to update SQL Merkle tree (ground truth)");
-                } else {
-                    debug!(merkle_updates = merkle_batch.len(), "SQL merkle tree updated");
-                    self.cf_inserts_since_snapshot.fetch_add(merkle_batch.len() as u64, Ordering::Relaxed);
-                }
+        // ====== Merkle: Calculate for dirty items from SQL ======
+        // Only run merkle calculation if enabled for this instance
+        // In multi-instance deployments, only designated nodes calculate merkle
+        if self.config.merkle_calc_enabled {
+            // Apply jitter to reduce contention between instances
+            if self.config.merkle_calc_jitter_ms > 0 {
+                let jitter = rand::random::<u64>() % self.config.merkle_calc_jitter_ms;
+                tokio::time::sleep(std::time::Duration::from_millis(jitter)).await;
             }
             
-            if let Some(ref redis_merkle) = self.redis_merkle {
-                if let Err(e) = redis_merkle.apply_batch(&merkle_batch).await {
-                    warn!(error = %e, "Failed to update Redis Merkle tree (cache)");
-                    crate::metrics::record_error("merkle", "redis_update", "backend");
-                } else {
-                    debug!(merkle_updates = merkle_batch.len(), "Redis merkle tree updated");
-                    crate::metrics::record_merkle_operation("redis", "batch_update", true);
+            // Fetch dirty items from SQL (up to batch size limit)
+            let dirty_limit = self.config.batch_flush_count.max(1000);
+            let dirty_items = if let Some(ref sql) = self.sql_store {
+                match sql.get_dirty_merkle_items(dirty_limit).await {
+                    Ok(items) => items,
+                    Err(e) => {
+                        warn!(error = %e, "Failed to fetch dirty merkle items");
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            
+            if !dirty_items.is_empty() {
+                let mut merkle_batch = MerkleBatch::new();
+                let mut processed_ids: Vec<String> = Vec::with_capacity(dirty_items.len());
+                
+                for item in &dirty_items {
+                    let payload_hash = PathMerkle::payload_hash(&item.content);
+                    let leaf_hash = PathMerkle::leaf_hash(
+                        &item.object_id,
+                        item.version,
+                        item.updated_at,
+                        &payload_hash,
+                    );
+                    merkle_batch.insert(item.object_id.clone(), leaf_hash);
+                    processed_ids.push(item.object_id.clone());
+                }
+                
+                // Apply merkle batch to SQL (ground truth) and Redis (cache)
+                let mut sql_success = false;
+                if let Some(ref sql_merkle) = self.sql_merkle {
+                    if let Err(e) = sql_merkle.apply_batch(&merkle_batch).await {
+                        error!(error = %e, "Failed to update SQL Merkle tree (ground truth)");
+                    } else {
+                        debug!(merkle_updates = merkle_batch.len(), "SQL merkle tree updated");
+                        self.cf_inserts_since_snapshot.fetch_add(merkle_batch.len() as u64, Ordering::Relaxed);
+                        sql_success = true;
+                    }
+                }
+                
+                if let Some(ref redis_merkle) = self.redis_merkle {
+                    if let Err(e) = redis_merkle.apply_batch(&merkle_batch).await {
+                        warn!(error = %e, "Failed to update Redis Merkle tree (cache)");
+                        crate::metrics::record_error("merkle", "redis_update", "backend");
+                    } else {
+                        debug!(merkle_updates = merkle_batch.len(), "Redis merkle tree updated");
+                        crate::metrics::record_merkle_operation("redis", "batch_update", true);
+                    }
+                }
+                
+                // Mark items clean ONLY if SQL merkle succeeded (ground truth)
+                if sql_success {
+                    if let Some(ref sql) = self.sql_store {
+                        if let Err(e) = sql.mark_merkle_clean(&processed_ids).await {
+                            warn!(error = %e, count = processed_ids.len(), "Failed to mark items merkle-clean");
+                        } else {
+                            debug!(count = processed_ids.len(), "Marked items merkle-clean");
+                        }
+                    }
                 }
             }
+        } else if batch_size > 0 {
+            debug!(
+                items = batch_size, 
+                "Merkle calculation disabled for this instance"
+            );
         }
         
         // Record comprehensive metrics for OTEL export

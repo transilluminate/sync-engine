@@ -92,7 +92,10 @@ impl SyncEngine {
                     }
                     self.sql_merkle = Some(sql_merkle);
                     
-                    self.l3_store = Some(std::sync::Arc::new(store));
+                    // Keep both Arc<dyn ArchiveStore> and Arc<SqlStore> for dirty merkle access
+                    let store = std::sync::Arc::new(store);
+                    self.sql_store = Some(store.clone());
+                    self.l3_store = Some(store);
                     tracing::Span::current().record("has_sql", true);
                     self.mysql_health.record_success();
                     crate::metrics::set_backend_healthy("mysql", true);

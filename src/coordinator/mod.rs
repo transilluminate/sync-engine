@@ -37,8 +37,10 @@ mod types;
 mod api;
 mod lifecycle;
 mod flush;
+mod merkle_api;
 
 pub use types::{EngineState, ItemStatus, BatchResult};
+pub use merkle_api::MerkleDiff;
 #[allow(unused_imports)]
 use types::WriteTarget;
 
@@ -54,6 +56,7 @@ use crate::sync_item::SyncItem;
 use crate::submit_options::SubmitOptions;
 use crate::backpressure::BackpressureLevel;
 use crate::storage::traits::{CacheStore, ArchiveStore, StorageError};
+use crate::storage::sql::SqlStore;
 use crate::cuckoo::filter_manager::{FilterManager, FilterTrust};
 use crate::cuckoo::FilterPersistence;
 use crate::batching::hybrid_batcher::{HybridBatcher, BatchConfig, SizedItem};
@@ -97,6 +100,9 @@ pub struct SyncEngine {
 
     /// L3: MySQL/SQLite archive (optional)
     pub(super) l3_store: Option<Arc<dyn ArchiveStore>>,
+    
+    /// L3: Direct SqlStore reference for dirty merkle operations
+    pub(super) sql_store: Option<Arc<SqlStore>>,
 
     /// L3 Cuckoo filter (L2 has no filter - TTL makes it unreliable)
     pub(super) l3_filter: Arc<FilterManager>,
@@ -150,6 +156,7 @@ impl SyncEngine {
             l1_size_bytes: Arc::new(AtomicUsize::new(0)),
             l2_store: None,
             l3_store: None,
+            sql_store: None,
             l3_filter: Arc::new(FilterManager::new("sync-engine-l3", 100_000)),
             filter_persistence: None,
             cf_inserts_since_snapshot: AtomicU64::new(0),
