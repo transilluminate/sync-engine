@@ -53,6 +53,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         redis_url: Some("redis://localhost:6379".into()),
         // Connect to docker-compose MySQL  
         sql_url: Some("mysql://test:test@localhost:3306/test".into()),
+        // Namespace prefix for Redis keys (plays nice with other data)
+        redis_prefix: Some("sync:".into()),
         // L1 memory limit (64MB for demo)
         l1_max_bytes: 64 * 1024 * 1024,
         // Batch settings (flush quickly for demo)
@@ -224,8 +226,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   ✅ WAL cleanup complete!");
     
     println!("\n💡 Data remains in Redis/MySQL - inspect with:");
-    println!("   └─ Redis:  redis-cli GET user.alice");
-    println!("   └─ MySQL:  SELECT * FROM sync_items;");
+    println!("   └─ Redis:  redis-cli JSON.GET sync:user.alice '$.payload'");
+    println!("   └─ MySQL:  SELECT id, payload FROM sync_items;");
+    println!("   └─ Query:  SELECT * FROM sync_items WHERE JSON_EXTRACT(payload, '$.name') = 'Alice';");
     println!("   └─ UIs:    http://localhost:5540 (RedisInsight)");
     println!("              http://localhost:8080 (Adminer)");
 

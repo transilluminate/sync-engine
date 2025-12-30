@@ -166,8 +166,8 @@ impl SyncEngine {
         // ========== PHASE 6: Connect to Redis (L2 - cache) ==========
         let phase_start = std::time::Instant::now();
         if let Some(ref redis_url) = self.config.redis_url {
-            info!(url = %redis_url, "Connecting to Redis (L2 - cache)...");
-            match crate::storage::redis::RedisStore::new(redis_url).await {
+            info!(url = %redis_url, prefix = ?self.config.redis_prefix, "Connecting to Redis (L2 - cache)...");
+            match crate::storage::redis::RedisStore::with_prefix(redis_url, self.config.redis_prefix.as_deref()).await {
                 Ok(store) => {
                     let redis_merkle = RedisMerkleStore::new(store.connection());
                     self.redis_merkle = Some(redis_merkle);

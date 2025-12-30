@@ -32,6 +32,11 @@ pub struct SyncEngineConfig {
     #[serde(default)]
     pub redis_url: Option<String>,
     
+    /// Redis key prefix for namespacing (e.g., "myapp:" → keys become "myapp:user.alice")
+    /// Allows sync-engine to coexist with other data in the same Redis instance.
+    #[serde(default)]
+    pub redis_prefix: Option<String>,
+    
     /// SQL connection string (e.g., "sqlite:sync.db" or "mysql://user:pass@host/db")
     #[serde(default)]
     pub sql_url: Option<String>,
@@ -39,6 +44,18 @@ pub struct SyncEngineConfig {
     /// L1 cache max size in bytes (default: 256 MB)
     #[serde(default = "default_l1_max_bytes")]
     pub l1_max_bytes: usize,
+    
+    /// Maximum payload size in bytes (default: 16 MB)
+    /// 
+    /// Payloads larger than this will be rejected with an error.
+    /// This prevents a single large item (e.g., 1TB file) from exhausting
+    /// the L1 cache. Set to 0 for unlimited (not recommended).
+    /// 
+    /// **Important**: This is a safety limit. Developers should choose a value
+    /// appropriate for their use case. For binary blobs, consider using
+    /// external object storage (S3, GCS) and storing only references here.
+    #[serde(default = "default_max_payload_bytes")]
+    pub max_payload_bytes: usize,
     
     /// Backpressure thresholds
     #[serde(default = "default_backpressure_warn")]
@@ -86,6 +103,7 @@ pub struct SyncEngineConfig {
 }
 
 fn default_l1_max_bytes() -> usize { 256 * 1024 * 1024 } // 256 MB
+fn default_max_payload_bytes() -> usize { 16 * 1024 * 1024 } // 16 MB
 fn default_backpressure_warn() -> f64 { 0.7 }
 fn default_backpressure_critical() -> f64 { 0.9 }
 fn default_batch_flush_ms() -> u64 { 100 }
@@ -103,7 +121,9 @@ impl Default for SyncEngineConfig {
         Self {
             redis_url: None,
             sql_url: None,
+            redis_prefix: None,
             l1_max_bytes: default_l1_max_bytes(),
+            max_payload_bytes: default_max_payload_bytes(),
             backpressure_warn: default_backpressure_warn(),
             backpressure_critical: default_backpressure_critical(),
             batch_flush_ms: default_batch_flush_ms(),

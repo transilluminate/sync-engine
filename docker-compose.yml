@@ -31,7 +31,7 @@ services:
     container_name: redis
     ports:
       - "6379:6379"
-    command: |
+    command: >
       redis-server 
       --save "" 
       --appendonly no 
@@ -39,6 +39,7 @@ services:
       --maxmemory-policy allkeys-lru 
       --loglevel notice
       --protected-mode no
+      --loadmodule /opt/redis-stack/lib/rejson.so
       --loadmodule /opt/redis-stack/lib/redisearch.so
     tmpfs:
       - /data:rw,noexec,nosuid,size=1024

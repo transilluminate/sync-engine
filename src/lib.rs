@@ -125,7 +125,7 @@ pub mod metrics;
 pub use config::SyncEngineConfig;
 pub use coordinator::{SyncEngine, EngineState, ItemStatus, BatchResult};
 pub use backpressure::BackpressureLevel;
-pub use sync_item::{SyncItem, CrdtSnapshot};
+pub use sync_item::{SyncItem, CrdtSnapshot, ContentType};
 pub use submit_options::{CacheTtl, OptionsKey, SubmitOptions};
 pub use storage::traits::{CacheStore, ArchiveStore, StorageError};
 pub use cuckoo::filter_manager::{FilterManager, FilterTrust};

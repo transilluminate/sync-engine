@@ -26,6 +26,65 @@ use serde::{Deserialize, Serialize};
 use crate::batching::hybrid_batcher::{SizedItem, BatchableItem};
 use crate::submit_options::SubmitOptions;
 
+/// Content type classification for storage routing.
+///
+/// This enables intelligent storage: JSON content can be stored in Redis as
+/// searchable hashes (HSET) and in SQL as queryable JSON columns, while binary
+/// content uses efficient blob storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ContentType {
+    /// JSON content - stored as Redis HASH, SQL JSON column
+    /// Enables: RedisSearch FT.SEARCH, SQL JSON path queries
+    Json,
+    /// Binary/opaque content - stored as Redis STRING, SQL BLOB
+    /// Fast path for non-structured data
+    #[default]
+    Binary,
+}
+
+impl ContentType {
+    /// Detect content type from raw bytes.
+    /// 
+    /// Fast heuristic: checks first non-whitespace byte for JSON indicators,
+    /// then validates with a full parse only for likely-JSON content.
+    #[must_use]
+    pub fn detect(content: &[u8]) -> Self {
+        // Empty content is binary
+        if content.is_empty() {
+            return ContentType::Binary;
+        }
+        
+        // Fast path: check first non-whitespace byte
+        let first = content.iter().find(|b| !b.is_ascii_whitespace());
+        match first {
+            Some(b'{') | Some(b'[') | Some(b'"') => {
+                // Likely JSON - validate with parse
+                if serde_json::from_slice::<serde_json::Value>(content).is_ok() {
+                    ContentType::Json
+                } else {
+                    ContentType::Binary
+                }
+            }
+            _ => ContentType::Binary
+        }
+    }
+    
+    /// Check if this is JSON content
+    #[inline]
+    #[must_use]
+    pub fn is_json(&self) -> bool {
+        matches!(self, ContentType::Json)
+    }
+    
+    /// Check if this is binary content
+    #[inline]
+    #[must_use]
+    pub fn is_binary(&self) -> bool {
+        matches!(self, ContentType::Binary)
+    }
+}
+
 /// A wrapper struct that separates metadata from content.
 ///
 /// # Binary-First Design
@@ -55,6 +114,11 @@ pub struct SyncItem {
     pub version: u64,
     /// Last update timestamp (epoch millis)
     pub updated_at: i64,
+    /// Content type (json or binary) - determines storage format
+    /// JSON → Redis HSET (searchable), SQL JSON column
+    /// Binary → Redis SET, SQL BLOB column
+    #[serde(default)]
+    pub content_type: ContentType,
     /// Batch ID for tracking batch writes (UUID, set during batch flush)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_id: Option<String>,
@@ -93,19 +157,26 @@ pub struct SyncItem {
 impl SyncItem {
     /// Create a new SyncItem with binary content.
     ///
+    /// The content type is auto-detected: if the bytes are valid JSON,
+    /// `content_type` will be `Json`, otherwise `Binary`. This enables
+    /// intelligent storage routing (HSET vs SET in Redis, JSON vs BLOB in SQL).
+    ///
     /// # Example
     ///
     /// ```rust
-    /// use sync_engine::SyncItem;
+    /// use sync_engine::{SyncItem, ContentType};
     ///
-    /// // From raw bytes
+    /// // From raw bytes (detected as Binary)
     /// let item = SyncItem::new("id".into(), vec![1, 2, 3]);
+    /// assert_eq!(item.content_type, ContentType::Binary);
     ///
-    /// // From JSON (serialize yourself)
+    /// // From JSON bytes (detected as Json)
     /// let json = serde_json::to_vec(&serde_json::json!({"key": "value"})).unwrap();
     /// let item = SyncItem::new("id".into(), json);
+    /// assert_eq!(item.content_type, ContentType::Json);
     /// ```
     pub fn new(object_id: String, content: Vec<u8>) -> Self {
+        let content_type = ContentType::detect(&content);
         Self {
             object_id,
             version: 1,
@@ -113,6 +184,7 @@ impl SyncItem {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as i64,
+            content_type,
             batch_id: None,
             trace_parent: None,
             trace_state: None,
@@ -129,11 +201,49 @@ impl SyncItem {
 
     /// Create a new SyncItem from a JSON value (convenience method).
     ///
-    /// This serializes the JSON to bytes for you. For better performance
-    /// with binary formats (MessagePack, Cap'n Proto), use [`new`](Self::new).
+    /// This serializes the JSON to bytes and sets `content_type` to `Json`.
+    /// For binary formats (MessagePack, Cap'n Proto), use [`new`](Self::new).
     pub fn from_json(object_id: String, value: serde_json::Value) -> Self {
         let content = serde_json::to_vec(&value).unwrap_or_default();
-        Self::new(object_id, content)
+        let mut item = Self::new(object_id, content);
+        item.content_type = ContentType::Json; // Explicit, since we know it's JSON
+        item
+    }
+    
+    /// Reconstruct a SyncItem from stored components (used by storage backends).
+    /// 
+    /// This allows storage backends to rebuild a SyncItem from flattened data
+    /// (e.g., Redis HGETALL, SQL column reads) without accessing private fields.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconstruct(
+        object_id: String,
+        version: u64,
+        updated_at: i64,
+        content_type: ContentType,
+        content: Vec<u8>,
+        batch_id: Option<String>,
+        trace_parent: Option<String>,
+        merkle_root: String,
+        home_instance_id: Option<String>,
+    ) -> Self {
+        Self {
+            object_id,
+            version,
+            updated_at,
+            content_type,
+            batch_id,
+            trace_parent,
+            trace_state: None,
+            priority_score: 0.0,
+            merkle_root,
+            last_accessed: 0,
+            access_count: 0,
+            content,
+            home_instance_id,
+            submit_options: None,
+            cached_size: OnceLock::new(),
+        }
     }
 
     /// Set submit options for this item (builder pattern).
