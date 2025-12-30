@@ -5,7 +5,7 @@
 use tracing::{info, warn, debug, error};
 
 use crate::storage::traits::StorageError;
-use crate::cuckoo::{FilterPersistence, L2_FILTER_ID, L3_FILTER_ID};
+use crate::cuckoo::{FilterPersistence, L3_FILTER_ID};
 use crate::merkle::{RedisMerkleStore, SqlMerkleStore, MerkleBatch, PathMerkle};
 use crate::resilience::wal::WriteAheadLog;
 
@@ -218,20 +218,7 @@ impl SyncEngine {
             None => return,
         };
         
-        // Try L2 filter
-        match persistence.load(L2_FILTER_ID).await {
-            Ok(Some(state)) if &state.merkle_root == sql_root => {
-                if let Err(e) = self.l2_filter.import(&state.filter_bytes) {
-                    warn!(error = %e, "Failed to import L2 filter from snapshot");
-                } else {
-                    self.l2_filter.mark_trusted();
-                    info!(entries = state.entry_count, "Restored L2 cuckoo filter from snapshot");
-                }
-            }
-            Ok(Some(_)) => warn!("L2 CF snapshot merkle root mismatch - filter will be rebuilt"),
-            Ok(None) => info!("No L2 CF snapshot found - filter will be built on warmup"),
-            Err(e) => warn!(error = %e, "Failed to load L2 CF snapshot"),
-        }
+        // Note: L2 filter removed (TTL makes it untrustworthy - use Redis EXISTS)
         
         // Try L3 filter
         match persistence.load(L3_FILTER_ID).await {
@@ -273,7 +260,7 @@ impl SyncEngine {
             if let Some(ref l3_store) = self.l3_store {
                 for object_id in &leaf_paths {
                     if let Ok(Some(item)) = l3_store.get(object_id).await {
-                        let payload_hash = PathMerkle::payload_hash(item.content.to_string().as_bytes());
+                        let payload_hash = PathMerkle::payload_hash(&item.content);
                         let leaf_hash = PathMerkle::leaf_hash(
                             &item.object_id,
                             item.version,
@@ -383,9 +370,8 @@ impl SyncEngine {
         }
         
         info!(
-            l2_trust = ?self.l2_filter.trust_state(),
             l3_trust = ?self.l3_filter.trust_state(),
-            "Cuckoo filter warmup complete"
+            "Cuckoo filter warmup complete (L3 only, Redis uses EXISTS)"
         );
 
         let _ = self.state.send(EngineState::Ready);

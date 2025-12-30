@@ -3,15 +3,17 @@
 //! Internal operations for flushing batches to L2/L3, WAL management,
 //! cuckoo filter snapshots, and health checks.
 
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{info, warn, debug, error};
 
 use crate::storage::traits::StorageError;
 use crate::sync_item::SyncItem;
+use crate::submit_options::OptionsKey;
 use crate::merkle::{MerkleBatch, PathMerkle};
 use crate::batching::hybrid_batcher::FlushBatch;
-use crate::cuckoo::{L2_FILTER_ID, L3_FILTER_ID};
+use crate::cuckoo::L3_FILTER_ID;
 
 use super::{SyncEngine, WriteTarget};
 
@@ -58,15 +60,9 @@ impl SyncEngine {
         
         let inserts = self.cf_inserts_since_snapshot.swap(0, Ordering::Relaxed);
         
-        // Snapshot L2 filter
-        if let Some(l2_bytes) = self.l2_filter.export() {
-            let l2_count = self.l2_filter.len();
-            if let Err(e) = persistence.save(L2_FILTER_ID, &l2_bytes, &merkle_root, l2_count).await {
-                warn!(error = %e, "Failed to snapshot L2 cuckoo filter");
-            }
-        }
+        // Note: L2 filter removed (TTL makes it untrustworthy - use Redis EXISTS)
         
-        // Snapshot L3 filter
+        // Snapshot L3 filter only
         if let Some(l3_bytes) = self.l3_filter.export() {
             let l3_count = self.l3_filter.len();
             if let Err(e) = persistence.save(L3_FILTER_ID, &l3_bytes, &merkle_root, l3_count).await {
@@ -79,10 +75,9 @@ impl SyncEngine {
         info!(
             reason = reason,
             inserts_since_last = inserts,
-            l2_entries = self.l2_filter.len(),
             l3_entries = self.l3_filter.len(),
             merkle_root = %hex::encode(merkle_root),
-            "Cuckoo filters snapshot saved"
+            "Cuckoo filter snapshot saved (L3 only)"
         );
     }
     
@@ -143,82 +138,107 @@ impl SyncEngine {
         }
     }
 
-    /// Internal: flush a batch to L2/L3, update Merkle tree
+    /// Internal: flush a batch to L2/L3, grouped by options for efficiency.
+    ///
+    /// Items are grouped by their `OptionsKey` so that:
+    /// - All items with same options go in one Redis pipeline
+    /// - All items with same options go in one SQL batch INSERT
     pub(super) async fn flush_batch_internal(&self, batch: FlushBatch<SyncItem>) {
         let batch_size = batch.items.len();
-        debug!(batch_size = batch_size, reason = ?batch.reason, "Flushing L2 batch");
+        debug!(batch_size = batch_size, reason = ?batch.reason, "Flushing batch");
         
-        let mut items: Vec<SyncItem> = batch.items;
-        
-        // ====== L2: Pipelined Redis writes ======
-        let mut l2_success = 0;
-        let mut l2_errors = 0;
-        
-        if let Some(ref l2) = self.l2_store {
-            match l2.put_batch(&items).await {
-                Ok(result) => {
-                    l2_success = result.written;
-                    for item in &items {
-                        self.l2_filter.insert(&item.object_id);
-                    }
-                    debug!(written = result.written, "L2 pipelined batch write complete");
-                }
-                Err(e) => {
-                    warn!(error = %e, "L2 batch write failed");
-                    l2_errors = items.len();
-                }
-            }
+        // ====== Group items by compatible options ======
+        let mut groups: HashMap<OptionsKey, Vec<SyncItem>> = HashMap::new();
+        for item in batch.items {
+            let key = OptionsKey::from(&item.effective_options());
+            groups.entry(key).or_default().push(item);
         }
         
-        // ====== L3: Batched SQL writes with verification ======
-        let mut l3_success = 0;
-        let mut wal_fallback = 0;
+        let group_count = groups.len();
+        debug!(group_count, "Grouped items by options");
         
-        if self.mysql_health.is_healthy() {
-            if let Some(ref l3) = self.l3_store {
-                match l3.put_batch(&mut items).await {
-                    Ok(result) => {
-                        l3_success = result.written;
-                        if result.verified {
-                            for item in &items {
-                                self.l3_filter.insert(&item.object_id);
-                            }
-                            self.mysql_health.record_success();
-                            debug!(batch_id = %result.batch_id, written = result.written, "L3 batch write verified");
-                        } else {
-                            warn!(batch_id = %result.batch_id, "L3 batch verification failed");
+        // ====== Flush each group ======
+        let mut total_l2_success = 0;
+        let mut total_l2_errors = 0;
+        let mut total_l3_success = 0;
+        let mut total_wal_fallback = 0;
+        let mut all_items: Vec<SyncItem> = Vec::with_capacity(batch_size);
+        
+        for (options_key, mut items) in groups {
+            let options = options_key.to_options();
+            let group_size = items.len();
+            
+            // ====== L2: Pipelined Redis writes (if enabled for this group) ======
+            if options.redis {
+                if let Some(ref l2) = self.l2_store {
+                    // Get TTL in seconds from CacheTtl enum
+                    let ttl_secs = options.redis_ttl.as_ref().map(|ttl| ttl.to_duration().as_secs());
+                    match l2.put_batch_with_ttl(&items, ttl_secs).await {
+                        Ok(result) => {
+                            total_l2_success += result.written;
+                            // Note: No L2 filter - TTL makes filters untrustworthy
+                            debug!(written = result.written, ttl = ?ttl_secs, "L2 group write complete");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, group_size, "L2 group write failed");
+                            total_l2_errors += group_size;
                         }
                     }
-                    Err(e) => {
-                        warn!(error = %e, "L3 batch write failed, falling back to WAL");
-                        self.mysql_health.record_failure();
-                        if let Some(ref wal) = self.l3_wal {
-                            for item in &items {
-                                if let Err(e) = wal.write(item).await {
-                                    warn!(id = %item.object_id, error = %e, "WAL write also failed!");
+                }
+            }
+            
+            // ====== L3: Batched SQL writes (if enabled for this group) ======
+            if options.sql {
+                if self.mysql_health.is_healthy() {
+                    if let Some(ref l3) = self.l3_store {
+                        match l3.put_batch(&mut items).await {
+                            Ok(result) => {
+                                total_l3_success += result.written;
+                                if result.verified {
+                                    for item in &items {
+                                        self.l3_filter.insert(&item.object_id);
+                                    }
+                                    self.mysql_health.record_success();
+                                    debug!(batch_id = %result.batch_id, written = result.written, "L3 group write verified");
                                 } else {
-                                    wal_fallback += 1;
+                                    warn!(batch_id = %result.batch_id, "L3 group verification failed");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, group_size, "L3 group write failed, falling back to WAL");
+                                self.mysql_health.record_failure();
+                                if let Some(ref wal) = self.l3_wal {
+                                    for item in &items {
+                                        if let Err(e) = wal.write(item).await {
+                                            warn!(id = %item.object_id, error = %e, "WAL write also failed!");
+                                        } else {
+                                            total_wal_fallback += 1;
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
+                } else if let Some(ref wal) = self.l3_wal {
+                    for item in &items {
+                        if let Err(e) = wal.write(item).await {
+                            warn!(id = %item.object_id, error = %e, "WAL write failed!");
+                        } else {
+                            total_wal_fallback += 1;
+                        }
+                    }
                 }
             }
-        } else if let Some(ref wal) = self.l3_wal {
-            for item in &items {
-                if let Err(e) = wal.write(item).await {
-                    warn!(id = %item.object_id, error = %e, "WAL write failed!");
-                } else {
-                    wal_fallback += 1;
-                }
-            }
+            
+            // Collect items for Merkle update
+            all_items.extend(items);
         }
         
-        // ====== Merkle: Compute and update hashes ======
+        // ====== Merkle: Compute and update hashes (for ALL items) ======
         let mut merkle_batch = MerkleBatch::new();
         
-        for item in &items {
-            let payload_hash = PathMerkle::payload_hash(item.content.to_string().as_bytes());
+        for item in &all_items {
+            let payload_hash = PathMerkle::payload_hash(&item.content);
             let leaf_hash = PathMerkle::leaf_hash(
                 &item.object_id,
                 item.version,
@@ -247,7 +267,15 @@ impl SyncEngine {
             }
         }
         
-        info!(l2_success, l2_errors, l3_success, wal_fallback, reason = ?batch.reason, "Batch flush complete");
+        info!(
+            l2_success = total_l2_success, 
+            l2_errors = total_l2_errors, 
+            l3_success = total_l3_success, 
+            wal_fallback = total_wal_fallback, 
+            groups = group_count,
+            reason = ?batch.reason, 
+            "Batch flush complete"
+        );
     }
     
     /// Write an item to L3 (MySQL) or fall back to WAL if MySQL is unavailable.

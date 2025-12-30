@@ -54,6 +54,10 @@ impl CacheStore for InMemoryStore {
         self.data.remove(id);
         Ok(())
     }
+
+    async fn exists(&self, id: &str) -> Result<bool, StorageError> {
+        Ok(self.data.contains_key(id))
+    }
 }
 
 #[cfg(test)]
@@ -62,7 +66,7 @@ mod tests {
     use serde_json::json;
 
     fn test_item(id: &str) -> SyncItem {
-        SyncItem::new(id.to_string(), json!({"test": "data", "id": id}))
+        SyncItem::from_json(id.to_string(), json!({"test": "data", "id": id}))
     }
 
     #[tokio::test]
@@ -120,8 +124,8 @@ mod tests {
     async fn test_put_overwrites() {
         let store = InMemoryStore::new();
         
-        let item1 = SyncItem::new("same-id".to_string(), json!({"version": 1}));
-        let item2 = SyncItem::new("same-id".to_string(), json!({"version": 2}));
+        let item1 = SyncItem::from_json("same-id".to_string(), json!({"version": 1}));
+        let item2 = SyncItem::from_json("same-id".to_string(), json!({"version": 2}));
         
         store.put(&item1).await.unwrap();
         store.put(&item2).await.unwrap();
@@ -129,7 +133,8 @@ mod tests {
         assert_eq!(store.len(), 1);
         
         let result = store.get("same-id").await.unwrap().unwrap();
-        assert_eq!(result.content["version"], 2);
+        let content = result.content_as_json().unwrap();
+        assert_eq!(content["version"], 2);
     }
 
     #[tokio::test]

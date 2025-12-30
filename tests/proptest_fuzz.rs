@@ -21,11 +21,8 @@ fn valid_sync_item_strategy() -> impl Strategy<Value = SyncItem> {
         prop::collection::vec(any::<u8>(), 0..1000),  // random content bytes
     )
         .prop_map(|(id, bytes)| {
-            let content = json!({
-                "data": base64_encode(&bytes),
-                "size": bytes.len(),
-            });
-            SyncItem::new(id, content)
+            // Store raw bytes directly - binary-first
+            SyncItem::new(id, bytes)
         })
 }
 
@@ -51,11 +48,6 @@ fn arbitrary_json_strategy() -> impl Strategy<Value = Value> {
             ]
         },
     )
-}
-
-fn base64_encode(bytes: &[u8]) -> String {
-    // Simple hex encoding for test data
-    hex::encode(bytes)
 }
 
 // =============================================================================
@@ -155,7 +147,7 @@ proptest! {
         id in ".*",
         content in arbitrary_json_strategy(),
     ) {
-        let item = SyncItem::new(id, content);
+        let item = SyncItem::from_json(id, content);
         let size = item.size_bytes();
         prop_assert!(size > 0, "Size should always be positive");
     }
@@ -176,7 +168,7 @@ proptest! {
     fn prop_object_id_special_chars(
         id in "[\\x00-\\xFF]{0,255}",
     ) {
-        let item = SyncItem::new(id.clone(), json!({"test": true}));
+        let item = SyncItem::new(id.clone(), b"test".to_vec());
         prop_assert_eq!(&item.object_id, &id);
         
         // Should serialize/deserialize without panic
@@ -212,7 +204,7 @@ proptest! {
         null_count in 0usize..100,
     ) {
         let id = "\0".repeat(null_count);
-        let item = SyncItem::new(id.clone(), json!(null));
+        let item = SyncItem::new(id.clone(), vec![]);
         
         prop_assert_eq!(item.object_id.len(), null_count);
         prop_assert!(item.size_bytes() > 0);
@@ -223,8 +215,9 @@ proptest! {
     fn prop_large_content(
         size in 0usize..100_000,
     ) {
-        let large_string = "x".repeat(size);
-        let item = SyncItem::new("test.large".into(), json!({"data": large_string}));
+        // Use raw bytes instead of JSON
+        let large_bytes: Vec<u8> = vec![b'x'; size];
+        let item = SyncItem::new("test.large".into(), large_bytes);
         
         let computed_size = item.size_bytes();
         prop_assert!(computed_size >= size, "Size should include content");
@@ -238,7 +231,7 @@ proptest! {
             value = json!({ format!("level_{}", i): value });
         }
         
-        let item = SyncItem::new("test.nested".into(), value);
+        let item = SyncItem::from_json("test.nested".into(), value);
         prop_assert!(item.size_bytes() > 0);
         
         // Serialization should work

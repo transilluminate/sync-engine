@@ -73,6 +73,13 @@ impl FilterManager {
         }
     }
 
+    /// Check if filter is trusted (convenience method).
+    #[must_use]
+    #[inline]
+    pub fn is_trusted(&self) -> bool {
+        self.trust_state.load(Ordering::Acquire)
+    }
+
     /// Mark filter as trusted (after warmup + verification).
     pub fn mark_trusted(&self) {
         info!(

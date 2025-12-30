@@ -1,3 +1,8 @@
+//! Redis storage backend for L2 cache.
+//!
+//! Stores `SyncItem` as raw bytes. The caller is responsible for any
+//! compression/serialization before calling submit().
+
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 use redis::{Client, AsyncCommands, pipe};
@@ -40,20 +45,20 @@ impl CacheStore for RedisStore {
             let mut conn = conn.clone();
             let id = id.clone();
             async move {
-                let data: Option<String> = conn.get(&id).await?;
+                let data: Option<Vec<u8>> = conn.get(&id).await?;
                 Ok(data)
             }
         })
         .await
         .map_err(|e: redis::RedisError| StorageError::Backend(e.to_string()))?
-        .map(|s| serde_json::from_str(&s).map_err(|e| StorageError::Backend(e.to_string())))
+        .map(|bytes| serde_json::from_slice(&bytes).map_err(|e| StorageError::Backend(e.to_string())))
         .transpose()
     }
 
     async fn put(&self, item: &SyncItem) -> Result<(), StorageError> {
         let conn = self.connection.clone();
         let id = item.object_id.clone();
-        let data = serde_json::to_string(item)
+        let data = serde_json::to_vec(item)
             .map_err(|e| StorageError::Backend(e.to_string()))?;
 
         retry("redis_put", &RetryConfig::query(), || {
@@ -85,15 +90,36 @@ impl CacheStore for RedisStore {
         .map_err(|e: redis::RedisError| StorageError::Backend(e.to_string()))
     }
 
+    async fn exists(&self, id: &str) -> Result<bool, StorageError> {
+        let conn = self.connection.clone();
+        let id = id.to_string();
+
+        retry("redis_exists", &RetryConfig::query(), || {
+            let mut conn = conn.clone();
+            let id = id.clone();
+            async move {
+                let exists: bool = conn.exists(&id).await?;
+                Ok(exists)
+            }
+        })
+        .await
+        .map_err(|e: redis::RedisError| StorageError::Backend(e.to_string()))
+    }
+
     /// Write a batch of items using Redis pipeline (atomic, much faster than individual SETs).
     async fn put_batch(&self, items: &[SyncItem]) -> Result<BatchWriteResult, StorageError> {
-        self.put_batch_impl(items).await
+        self.put_batch_with_ttl(items, None).await
+    }
+    
+    /// Write a batch of items with optional TTL.
+    async fn put_batch_with_ttl(&self, items: &[SyncItem], ttl_secs: Option<u64>) -> Result<BatchWriteResult, StorageError> {
+        self.put_batch_impl(items, ttl_secs).await
     }
 }
 
 impl RedisStore {
     /// Pipelined batch write implementation.
-    async fn put_batch_impl(&self, items: &[SyncItem]) -> Result<BatchWriteResult, StorageError> {
+    async fn put_batch_impl(&self, items: &[SyncItem], ttl_secs: Option<u64>) -> Result<BatchWriteResult, StorageError> {
         if items.is_empty() {
             return Ok(BatchWriteResult {
                 batch_id: String::new(),
@@ -102,11 +128,11 @@ impl RedisStore {
             });
         }
 
-        // Serialize all items first
+        // Serialize all items first as bytes
         let serialized: Result<Vec<_>, _> = items.iter()
             .map(|item| {
-                serde_json::to_string(item)
-                    .map(|s| (item.object_id.clone(), s))
+                serde_json::to_vec(item)
+                    .map(|bytes| (item.object_id.clone(), bytes))
                     .map_err(|e| StorageError::Backend(e.to_string()))
             })
             .collect();
@@ -119,13 +145,16 @@ impl RedisStore {
             let mut conn = conn.clone();
             let serialized = serialized.clone();
             async move {
-                // Build the pipeline
                 let mut pipeline = pipe();
                 for (id, data) in &serialized {
-                    pipeline.set(id, data);
+                    if let Some(ttl) = ttl_secs {
+                        // Use SETEX for TTL (seconds)
+                        pipeline.cmd("SETEX").arg(id).arg(ttl as i64).arg(data.as_slice());
+                    } else {
+                        pipeline.set(id, data.as_slice());
+                    }
                 }
                 
-                // Execute atomically
                 pipeline.query_async::<()>(&mut conn).await?;
                 Ok(())
             }
@@ -134,9 +163,9 @@ impl RedisStore {
         .map_err(|e: redis::RedisError| StorageError::Backend(e.to_string()))?;
 
         Ok(BatchWriteResult {
-            batch_id: String::new(), // Redis doesn't need verification
+            batch_id: String::new(),
             written: count,
-            verified: true, // Pipeline is atomic
+            verified: true,
         })
     }
 

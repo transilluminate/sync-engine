@@ -33,9 +33,20 @@ pub trait CacheStore: Send + Sync {
     async fn put(&self, item: &SyncItem) -> Result<(), StorageError>;
     async fn delete(&self, id: &str) -> Result<(), StorageError>;
     
+    /// Check if an item exists (Redis EXISTS command - fast, no data transfer).
+    async fn exists(&self, id: &str) -> Result<bool, StorageError>;
+    
     /// Write a batch of items atomically (pipelined for Redis).
     /// Default implementation falls back to sequential puts.
     async fn put_batch(&self, items: &[SyncItem]) -> Result<BatchWriteResult, StorageError> {
+        self.put_batch_with_ttl(items, None).await
+    }
+    
+    /// Write a batch of items with optional TTL (in seconds).
+    /// For Redis: uses SETEX when ttl is Some, SET when None.
+    async fn put_batch_with_ttl(&self, items: &[SyncItem], ttl_secs: Option<u64>) -> Result<BatchWriteResult, StorageError> {
+        // Default: ignore TTL, just do sequential puts
+        let _ = ttl_secs;
         for item in items {
             self.put(item).await?;
         }
@@ -52,6 +63,9 @@ pub trait ArchiveStore: Send + Sync {
     async fn get(&self, id: &str) -> Result<Option<SyncItem>, StorageError>;
     async fn put(&self, item: &SyncItem) -> Result<(), StorageError>;
     async fn delete(&self, id: &str) -> Result<(), StorageError>;
+    
+    /// Check if an item exists (SQL EXISTS query - fast, no data transfer).
+    async fn exists(&self, id: &str) -> Result<bool, StorageError>;
     
     /// Write a batch of items with verification.
     /// The batch_id is stamped on items and can be queried back for verification.

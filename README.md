@@ -1,27 +1,29 @@
 # Sync Engine
 
-A high-performance, tiered synchronization engine for distributed data systems.
+High-performance tiered sync engine with L1/L2/L3 caching and Redis/SQL backends
 
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 
-## Overview
+## Philosophy: Dumb Byte Router
 
-Sync Engine provides a three-tier caching and persistence architecture optimized for read-heavy workloads with strong consistency guarantees:
+sync-engine stores `Vec<u8>` and routes to L1/L2/L3 based on caller-provided options.
+Compression, serialization, and data interpretation are the caller's responsibility.
+
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        Ingest Layer                         │
-│  • Accepts SyncItems via submit()                          │
+│  • Accepts SyncItems via submit() / submit_with()          │
 │  • Backpressure control based on memory usage              │
 └─────────────────────────────────────────────────────────────┘
                              │
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                    L1: In-Memory Cache                      │
-│  • DashMap for concurrent access                           │
+│  • Moka cache for concurrent access                        │
 │  • Tan-curve eviction under memory pressure                │
-│  • Cuckoo filter for existence checks                      │
 └─────────────────────────────────────────────────────────────┘
                              │
                    (Batch flush via HybridBatcher)
@@ -29,32 +31,31 @@ Sync Engine provides a three-tier caching and persistence architecture optimized
 ┌─────────────────────────────────────────────────────────────┐
 │                     L2: Redis Cache                         │
 │  • Pipelined batch writes for throughput                   │
-│  • Merkle tree shadow for sync verification                │
-│  • Cuckoo filter to skip network hops on miss              │
+│  • Optional per-item TTL                                   │
+│  • EXISTS command for fast existence checks                │
 └─────────────────────────────────────────────────────────────┘
                              │
                    (Batch persist to ground truth)
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                   L3: MySQL/SQLite Archive                  │
-│  • Ground truth storage                                    │
-│  • Merkle tree for sync verification                       │
+│  • Ground truth storage (BLOB column)                      │
+│  • Cuckoo filter for fast existence checks                 │
 │  • WAL fallback during outages                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Features
 
-- **Tiered Caching**: L1 (memory) → L2 (Redis) → L3 (MySQL) with automatic fallback
-- **Batch Writes**: Configurable flush by count, size, or time for throughput
-- **Cuckoo Filters**: Probabilistic existence checks to skip unnecessary network hops
-- **Merkle Trees**: Efficient sync verification between tiers
-- **WAL Durability**: Local SQLite WAL ensures no data loss during MySQL outages
-- **Backpressure**: Six-tier graceful degradation under memory pressure
-- **Circuit Breakers**: Prevent cascade failures to unhealthy backends
-- **Retry Logic**: Configurable exponential backoff for transient failures
-- **CRDT Support**: Optional CRDT-aware compaction with `crdt-data-types` integration
-- **Compression**: Optional transparent zstd compression for L3 storage
+- **Tiered Caching**: L1 (memory) → L2 (Redis) → L3 (SQL) with automatic fallback
+- **Binary Storage**: Store raw `Vec<u8>` - caller handles serialization/compression
+- **Flexible Routing**: `SubmitOptions` controls which tiers receive data
+- **TTL Support**: Per-item TTL for Redis cache entries
+- **Batch Writes**: Configurable flush by count, size, or time
+- **Cuckoo Filters**: Skip SQL queries when data definitely doesn't exist
+- **WAL Durability**: Local SQLite WAL during MySQL outages
+- **Backpressure**: Graceful degradation under memory pressure
+- **Circuit Breakers**: Prevent cascade failures to backends
 
 ## Quick Start
 
@@ -67,23 +68,10 @@ tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
 
-### Feature Flags
-
-```toml
-[dependencies]
-sync-engine = { version = "0.1", features = ["compression", "crdt"] }
-```
-
-| Feature | Description |
-|---------|-------------|
-| `compression` | Transparent zstd compression for L3 storage (~70% savings) |
-| `crdt` | CRDT-aware compaction using `crdt-data-types` crate |
-| `otel` | OpenTelemetry trace context propagation |
-
 Basic usage:
 
 ```rust
-use sync_engine::{SyncEngine, SyncEngineConfig, SyncItem};
+use sync_engine::{SyncEngine, SyncEngineConfig, SyncItem, SubmitOptions, CacheTtl};
 use serde_json::json;
 use tokio::sync::watch;
 
@@ -97,24 +85,54 @@ async fn main() {
 
     let (_tx, rx) = watch::channel(config.clone());
     let mut engine = SyncEngine::new(config, rx);
-    
-    // Start the engine (connects to backends)
     engine.start().await.expect("Failed to start");
 
-    // Submit items for sync
-    let item = SyncItem::new(
-        "uk.nhs.patient.record.12345".into(),
-        json!({"name": "John Doe", "nhs_number": "1234567890"})
+    // Submit with default options (Redis + SQL)
+    let item = SyncItem::from_json(
+        "uk.nhs.patient.12345".into(),
+        json!({"name": "John Doe"})
     );
     engine.submit(item).await.expect("Failed to submit");
 
-    // Retrieve items (L1 → L2 → L3 fallback)
-    if let Some(item) = engine.get("uk.nhs.patient.record.12345").await.unwrap() {
-        println!("Found: {:?}", item.content);
+    // Submit to Redis only with 1-hour TTL
+    let cache_item = SyncItem::from_json(
+        "cache.session.abc".into(),
+        json!({"user": "alice"})
+    );
+    engine.submit_with(cache_item, SubmitOptions::cache(CacheTtl::Hour))
+        .await.expect("Failed to submit");
+
+    // Retrieve (L1 → L2 → L3 fallback)
+    if let Some(item) = engine.get("uk.nhs.patient.12345").await.unwrap() {
+        println!("Found: {:?}", item.content_as_json());
     }
 
     engine.shutdown().await;
 }
+```
+
+## Submit Options
+
+Control where data is stored per-item:
+
+```rust
+use sync_engine::{SubmitOptions, CacheTtl};
+
+// Default: Redis + SQL
+let default = SubmitOptions::default();
+
+// Redis only with TTL (ephemeral cache)
+let cache = SubmitOptions::cache(CacheTtl::Hour);
+
+// SQL only (durable, skip Redis)
+let durable = SubmitOptions::durable();
+
+// Custom routing
+let custom = SubmitOptions {
+    redis: true,
+    redis_ttl: Some(CacheTtl::Day),
+    sql: false,
+};
 ```
 
 ## Configuration
@@ -128,79 +146,50 @@ async fn main() {
 | `batch_flush_count` | 1000 | Flush batch after N items |
 | `batch_flush_bytes` | 1 MB | Flush batch after N bytes |
 | `wal_path` | None | SQLite WAL path for durability |
-| `backpressure_warn` | 0.7 | Memory pressure warning threshold |
-| `backpressure_critical` | 0.9 | Memory pressure critical threshold |
-
-See [`SyncEngineConfig`](src/config.rs) for all options.
-
-## Architecture
-
-### Engine Lifecycle
-
-```
-Created → Connecting → DrainingWal → SyncingRedis → WarmingUp → Ready → Running → ShuttingDown
-```
-
-### Backpressure Levels
-
-| Level | Threshold | Behavior |
-|-------|-----------|----------|
-| Normal | < 70% | Accept all operations |
-| Warn | 70-80% | Evict aggressively, emit warnings |
-| Throttle | 80-90% | Rate limit writes (HTTP 429) |
-| Critical | 90-95% | Reject writes, reads only (HTTP 503) |
-| Emergency | 95-98% | Read-only mode, prepare shutdown |
-| Shutdown | > 98% | Graceful shutdown initiated |
-
-### Retry Strategies
-
-| Strategy | Max Retries | Use Case |
-|----------|-------------|----------|
-| `startup()` | 5 (~5s) | Initial connection, fail fast on bad config |
-| `daemon()` | ∞ | Runtime reconnection, never give up |
-| `query()` | 3 (~1s) | Individual operations, fail fast |
 
 ## Testing
 
+Comprehensive test suite with 211 tests covering unit, property-based, integration, and chaos testing:
+
+| Test Suite | Count | Description |
+|------------|-------|-------------|
+| **Unit Tests** | 150 | Fast, no external deps |
+| **Property Tests** | 12 | Proptest fuzzing for invariants |
+| **Integration Tests** | 20 | Real Redis/MySQL via testcontainers |
+| **Chaos Tests** | 10 | Failure injection, container killing |
+| **Doc Tests** | 19 | Example verification |
+| **Total** | **211** | ~78% code coverage |
+
+### Running Tests
+
 ```bash
-# Run unit tests (fast, no Docker required)
+# Unit tests (fast, no Docker)
 cargo test --lib
 
-# Run integration tests (requires Docker)
+# Property-based fuzzing
+cargo test --test proptest_fuzz
+
+# Integration tests (requires Docker)
 cargo test --test integration -- --ignored
 
-# Run all tests with coverage
-cargo llvm-cov --all-targets -- --include-ignored
+# Chaos tests (requires Docker)
+cargo test --test chaos -- --ignored
+
+# All tests
+cargo test -- --include-ignored
 ```
 
-Current coverage: **77%** with 164 tests (151 lib + 13 doc).
+### Chaos Testing Scenarios
 
-## Development
+The chaos test suite validates resilience under real-world failure conditions:
 
-```bash
-# Check for issues
-cargo clippy --all-targets
-
-# Format code
-cargo fmt
-
-# Generate documentation
-cargo doc --open
-
-# Run benchmarks (if available)
-cargo bench
-```
+- **Container killing**: Redis/MySQL death mid-operation
+- **Data corruption**: Garbage JSON, truncated data in Redis
+- **Lifecycle edge cases**: Double start, shutdown without start, ops after shutdown
+- **Concurrent failures**: Many writers during Redis death
+- **Memory pressure**: L1 overflow with backpressure
+- **Rapid cycles**: Start/stop 5x without resource leaks
 
 ## License
 
-This project is licensed under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0).
-
-This means:
-- ✅ You can use, modify, and distribute this software
-- ✅ You must keep the source code open
-- ✅ Network use (e.g., SaaS) requires sharing source code
-- ✅ Derivative works must use the same license
-
-## Contributing
-
-Contributions welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+[GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0)

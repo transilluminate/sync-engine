@@ -51,6 +51,7 @@ use tracing::{info, warn, debug, error};
 
 use crate::config::SyncEngineConfig;
 use crate::sync_item::SyncItem;
+use crate::submit_options::SubmitOptions;
 use crate::backpressure::BackpressureLevel;
 use crate::storage::traits::{CacheStore, ArchiveStore, StorageError};
 use crate::cuckoo::filter_manager::{FilterManager, FilterTrust};
@@ -97,10 +98,7 @@ pub struct SyncEngine {
     /// L3: MySQL/SQLite archive (optional)
     pub(super) l3_store: Option<Arc<dyn ArchiveStore>>,
 
-    /// L2 Cuckoo filter
-    pub(super) l2_filter: Arc<FilterManager>,
-
-    /// L3 Cuckoo filter  
+    /// L3 Cuckoo filter (L2 has no filter - TTL makes it unreliable)
     pub(super) l3_filter: Arc<FilterManager>,
 
     /// Filter persistence (for fast startup)
@@ -152,7 +150,6 @@ impl SyncEngine {
             l1_size_bytes: Arc::new(AtomicUsize::new(0)),
             l2_store: None,
             l3_store: None,
-            l2_filter: Arc::new(FilterManager::new("sync-engine-l2", 100_000)),
             l3_filter: Arc::new(FilterManager::new("sync-engine-l3", 100_000)),
             filter_persistence: None,
             cf_inserts_since_snapshot: AtomicU64::new(0),
@@ -229,24 +226,22 @@ impl SyncEngine {
             return Ok(Some(item.clone()));
         }
 
-        // 2. Check L2 filter before hitting Redis
-        if self.l2_filter.should_check_l3(id) {
-            if let Some(ref l2) = self.l2_store {
-                match l2.get(id).await {
-                    Ok(Some(item)) => {
-                        // Promote to L1
-                        self.insert_l1(item.clone());
-                        tracing::Span::current().record("tier", "L2");
-                        debug!("L2 hit, promoted to L1");
-                        return Ok(Some(item));
-                    }
-                    Ok(None) => {
-                        // False positive in filter
-                        debug!("L2 filter false positive");
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "L2 lookup failed");
-                    }
+        // 2. Try L2 (Redis) - no filter, just try it
+        if let Some(ref l2) = self.l2_store {
+            match l2.get(id).await {
+                Ok(Some(item)) => {
+                    // Promote to L1
+                    self.insert_l1(item.clone());
+                    tracing::Span::current().record("tier", "L2");
+                    debug!("L2 hit, promoted to L1");
+                    return Ok(Some(item));
+                }
+                Ok(None) => {
+                    // Not in Redis
+                    debug!("L2 miss");
+                }
+                Err(e) => {
+                    warn!(error = %e, "L2 lookup failed");
                 }
             }
         }
@@ -257,7 +252,6 @@ impl SyncEngine {
                 match l3.get(id).await {
                     Ok(Some(item)) => {
                         // Promote to L1
-                        self.l2_filter.insert(id);
                         if self.memory_pressure() < 1.0 {
                             self.insert_l1(item.clone());
                         }
@@ -296,8 +290,7 @@ impl SyncEngine {
         if !item.merkle_root.is_empty() {
             use sha2::{Sha256, Digest};
             
-            let content_bytes = item.content.to_string();
-            let computed = Sha256::digest(content_bytes.as_bytes());
+            let computed = Sha256::digest(&item.content);
             let computed_hex = hex::encode(computed);
             
             if computed_hex != item.merkle_root {
@@ -328,10 +321,38 @@ impl SyncEngine {
 
     /// Submit an item for sync.
     ///
-    /// The item is immediately stored in L1 and queued for batch write to L2.
+    /// The item is immediately stored in L1 and queued for batch write to L2/L3.
+    /// Uses default options: Redis + SQL (both enabled).
     /// Filters are updated only on successful writes in flush_batch_internal().
+    ///
+    /// For custom routing, use [`submit_with`](Self::submit_with).
     #[tracing::instrument(skip(self, item), fields(object_id = %item.object_id))]
     pub async fn submit(&self, item: SyncItem) -> Result<(), StorageError> {
+        self.submit_with(item, SubmitOptions::default()).await
+    }
+
+    /// Submit an item with custom routing options.
+    ///
+    /// The item is immediately stored in L1 and queued for batch write.
+    /// Items are batched by compatible options for efficient pipelined writes.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sync_engine::{SyncEngine, SyncItem, SubmitOptions, CacheTtl};
+    /// # async fn example(engine: &SyncEngine) -> Result<(), sync_engine::StorageError> {
+    /// // Cache-only with 1 minute TTL (no SQL write)
+    /// let item = SyncItem::new("cache.key".into(), b"data".to_vec());
+    /// engine.submit_with(item, SubmitOptions::cache(CacheTtl::Minute)).await?;
+    ///
+    /// // SQL-only durable storage (no Redis)
+    /// let item = SyncItem::new("archive.key".into(), b"data".to_vec());
+    /// engine.submit_with(item, SubmitOptions::durable()).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[tracing::instrument(skip(self, item, options), fields(object_id = %item.object_id, redis = options.redis, sql = options.sql))]
+    pub async fn submit_with(&self, mut item: SyncItem, options: SubmitOptions) -> Result<(), StorageError> {
         if !self.should_accept_writes() {
             return Err(StorageError::Backend(format!(
                 "Rejecting write: engine state={}, pressure={}",
@@ -342,6 +363,9 @@ impl SyncEngine {
 
         let id = item.object_id.clone();
 
+        // Attach options to item (travels through batch pipeline)
+        item.submit_options = Some(options);
+
         // Insert into L1 (immediate, in-memory)
         self.insert_l1(item.clone());
         
@@ -349,7 +373,7 @@ impl SyncEngine {
         // Filters are updated only on SUCCESSFUL writes in flush_batch_internal()
         // This prevents filter/storage divergence if writes fail.
         
-        // Queue for batched L2 persistence
+        // Queue for batched L2/L3 persistence
         self.l2_batcher.lock().await.add(item);
 
         debug!(id = %id, "Item submitted to L1 and batch queue");
@@ -384,8 +408,7 @@ impl SyncEngine {
             debug!("Deleted from L1");
         }
 
-        // 2. Remove from cuckoo filters (allows future negative lookups)
-        self.l2_filter.remove(id);
+        // 2. Remove from L3 cuckoo filter only (no L2 filter - TTL makes it unreliable)
         self.l3_filter.remove(id);
 
         // 3. Delete from L2 (Redis) - best effort
@@ -546,21 +569,10 @@ impl SyncEngine {
         )
     }
 
-    /// Get L2 filter stats (entries, capacity, trust_state)
-    #[must_use]
-    pub fn l2_filter_stats(&self) -> (usize, usize, FilterTrust) {
-        self.l2_filter.stats()
-    }
-
     /// Get L3 filter stats (entries, capacity, trust_state)
     #[must_use]
     pub fn l3_filter_stats(&self) -> (usize, usize, FilterTrust) {
         self.l3_filter.stats()
-    }
-
-    /// Get access to the L2 filter (for warmup/verification)
-    pub fn l2_filter(&self) -> &Arc<FilterManager> {
-        &self.l2_filter
     }
 
     /// Get access to the L3 filter (for warmup/verification)
@@ -583,7 +595,7 @@ mod tests {
     }
 
     fn create_test_item(id: &str) -> SyncItem {
-        SyncItem::new(
+        SyncItem::from_json(
             id.to_string(),
             json!({"data": "test"}),
         )
@@ -598,8 +610,10 @@ mod tests {
 
     #[test]
     fn test_memory_pressure_calculation() {
-        let mut config = SyncEngineConfig::default();
-        config.l1_max_bytes = 1000;
+        let config = SyncEngineConfig {
+            l1_max_bytes: 1000,
+            ..Default::default()
+        };
         let (_tx, rx) = watch::channel(config.clone());
         let engine = SyncEngine::new(config, rx);
 
@@ -636,7 +650,7 @@ mod tests {
         let (_, _size1) = engine.l1_stats();
         
         // Insert larger item with same ID
-        let item2 = SyncItem::new(
+        let item2 = SyncItem::from_json(
             "test1".to_string(),
             json!({"data": "much larger content here for testing size changes"}),
         );
@@ -686,10 +700,6 @@ mod tests {
     #[test]
     fn test_filter_stats() {
         let engine = create_test_engine();
-        
-        let (entries, capacity, _trust) = engine.l2_filter_stats();
-        assert_eq!(entries, 0);
-        assert!(capacity > 0);
         
         let (entries, capacity, _trust) = engine.l3_filter_stats();
         assert_eq!(entries, 0);

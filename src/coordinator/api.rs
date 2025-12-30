@@ -24,39 +24,70 @@ impl SyncEngine {
     // V1.1 API: Query & Batch Operations
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Check if an item exists (fast, uses Cuckoo filter).
+    /// Check if an item exists across all tiers.
     ///
-    /// This is a probabilistic check:
-    /// - `false` → definitely does not exist (if filter is trusted)
-    /// - `true` → might exist (false positives possible, ~3%)
+    /// Checks in order: L1 cache → Redis EXISTS → L3 Cuckoo filter → SQL query.
+    /// If found in SQL and Cuckoo filter was untrusted, updates the filter.
     ///
-    /// For authoritative existence check, use `get()` or `status()`.
+    /// # Returns
+    /// - `true` → item definitely exists in at least one tier
+    /// - `false` → item does not exist (authoritative)
     ///
     /// # Example
     ///
     /// ```rust,no_run
     /// # use sync_engine::SyncEngine;
     /// # async fn example(engine: &SyncEngine) {
-    /// if engine.contains("user.123") {
-    ///     // Item might exist - fetch it
+    /// if engine.contains("user.123").await {
     ///     let item = engine.get("user.123").await;
     /// } else {
-    ///     // Definitely doesn't exist - skip the lookup
     ///     println!("Not found");
     /// }
     /// # }
     /// ```
-    #[must_use]
-    #[inline]
-    pub fn contains(&self, id: &str) -> bool {
-        // Check L1 first (definitive)
+    pub async fn contains(&self, id: &str) -> bool {
+        // L1: In-memory cache (definitive, sync)
         if self.l1_cache.contains_key(id) {
             return true;
         }
         
-        // Check cuckoo filters (probabilistic)
-        // If either filter says "might exist", return true
-        self.l2_filter.should_check_l3(id) || self.l3_filter.should_check_l3(id)
+        // L2: Redis EXISTS (async, authoritative for Redis tier)
+        if let Some(ref l2) = self.l2_store {
+            if l2.exists(id).await.unwrap_or(false) {
+                return true;
+            }
+        }
+        
+        // L3: Cuckoo filter check (sync, probabilistic)
+        if self.l3_filter.is_trusted() {
+            // Filter is trusted - use it for fast negative
+            if !self.l3_filter.should_check_l3(id) {
+                return false; // Definitely not in L3
+            }
+        }
+        
+        // L3: SQL query (async, ground truth)
+        if let Some(ref l3) = self.l3_store {
+            if l3.exists(id).await.unwrap_or(false) {
+                // Found in SQL - update Cuckoo if it was untrusted
+                if !self.l3_filter.is_trusted() {
+                    self.l3_filter.insert(id);
+                }
+                return true;
+            }
+        }
+        
+        false
+    }
+    
+    /// Fast sync check if item might exist (L1 + Cuckoo only).
+    ///
+    /// Use this when you need a quick probabilistic check without async.
+    /// For authoritative check, use `contains()` instead.
+    #[must_use]
+    #[inline]
+    pub fn contains_fast(&self, id: &str) -> bool {
+        self.l1_cache.contains_key(id) || self.l3_filter.should_check_l3(id)
     }
 
     /// Get the current count of items in L1 cache.
@@ -101,9 +132,9 @@ impl SyncEngine {
             return ItemStatus::Pending;
         }
         
-        // Check L2 (if available)
+        // Check L2 (if available) - use EXISTS, no filter
         let in_l2 = if let Some(ref l2) = self.l2_store {
-            self.l2_filter.should_check_l3(id) && l2.get(id).await.ok().flatten().is_some()
+            l2.exists(id).await.unwrap_or(false)
         } else {
             false
         };
@@ -168,22 +199,19 @@ impl SyncEngine {
                 let id = ids[i].to_string();
                 let l2_store = self.l2_store.clone();
                 let l3_store = self.l3_store.clone();
-                let l2_filter = self.l2_filter.clone();
                 let l3_filter = self.l3_filter.clone();
                 
                 join_set.spawn(async move {
-                    // Try L2 first
+                    // Try L2 first (no filter, just try Redis)
                     if let Some(ref l2) = l2_store {
-                        if l2_filter.should_check_l3(&id) {
-                            if let Ok(Some(item)) = l2.get(&id).await {
-                                return (i, Some(item));
-                            }
+                        if let Ok(Some(item)) = l2.get(&id).await {
+                            return (i, Some(item));
                         }
                     }
                     
-                    // Fall back to L3
+                    // Fall back to L3 (use Cuckoo filter if trusted)
                     if let Some(ref l3) = l3_store {
-                        if l3_filter.should_check_l3(&id) {
+                        if !l3_filter.is_trusted() || l3_filter.should_check_l3(&id) {
                             if let Ok(Some(item)) = l3.get(&id).await {
                                 return (i, Some(item));
                             }
@@ -217,8 +245,8 @@ impl SyncEngine {
     /// # use serde_json::json;
     /// # async fn example(engine: &SyncEngine) {
     /// let items = vec![
-    ///     SyncItem::new("user.1".into(), json!({"name": "Alice"})),
-    ///     SyncItem::new("user.2".into(), json!({"name": "Bob"})),
+    ///     SyncItem::from_json("user.1".into(), json!({"name": "Alice"})),
+    ///     SyncItem::from_json("user.2".into(), json!({"name": "Bob"})),
     /// ];
     /// let result = engine.submit_many(items).await.unwrap();
     /// println!("Submitted: {}, Failed: {}", result.succeeded, result.failed);
@@ -288,8 +316,7 @@ impl SyncEngine {
                 self.l1_size_bytes.fetch_sub(size, Ordering::Release);
             }
             
-            // Remove from filters
-            self.l2_filter.remove(id);
+            // Remove from L3 filter (no L2 filter with TTL support)
             self.l3_filter.remove(id);
             
             // Queue merkle deletion
@@ -355,7 +382,7 @@ impl SyncEngine {
     /// # async fn example(engine: &SyncEngine) {
     /// let item = engine.get_or_insert_with("user.123", || async {
     ///     // Expensive operation - only runs if not cached
-    ///     SyncItem::new("user.123".into(), json!({"name": "Fetched from DB"}))
+    ///     SyncItem::from_json("user.123".into(), json!({"name": "Fetched from DB"}))
     /// }).await.unwrap();
     /// # }
     /// ```
@@ -401,34 +428,33 @@ mod tests {
     }
 
     fn test_item(id: &str) -> SyncItem {
-        SyncItem::new(id.to_string(), json!({"test": "data", "id": id}))
+        SyncItem::from_json(id.to_string(), json!({"test": "data", "id": id}))
     }
 
-    #[test]
-    fn test_contains_l1_hit() {
+    #[tokio::test]
+    async fn test_contains_l1_hit() {
         let config = test_config();
         let (_tx, rx) = watch::channel(config.clone());
         let engine = SyncEngine::new(config, rx);
         
         engine.l1_cache.insert("test.exists".into(), test_item("test.exists"));
         
-        assert!(engine.contains("test.exists"));
+        assert!(engine.contains("test.exists").await);
     }
 
-    #[test]
-    fn test_contains_with_trusted_filter() {
+    #[tokio::test]
+    async fn test_contains_with_trusted_filter() {
         let config = test_config();
         let (_tx, rx) = watch::channel(config.clone());
         let engine = SyncEngine::new(config, rx);
         
-        engine.l2_filter.mark_trusted();
         engine.l3_filter.mark_trusted();
         
         engine.l1_cache.insert("test.exists".into(), test_item("test.exists"));
-        engine.l2_filter.insert("test.exists");
+        engine.l3_filter.insert("test.exists");
         
-        assert!(engine.contains("test.exists"));
-        assert!(!engine.contains("test.missing"));
+        assert!(engine.contains("test.exists").await);
+        assert!(!engine.contains("test.missing").await);
     }
 
     #[test]
@@ -538,9 +564,9 @@ mod tests {
         assert!(result.is_success());
         
         assert_eq!(engine.len(), 3);
-        assert!(engine.contains("batch.1"));
-        assert!(engine.contains("batch.2"));
-        assert!(engine.contains("batch.3"));
+        assert!(engine.contains("batch.1").await);
+        assert!(engine.contains("batch.2").await);
+        assert!(engine.contains("batch.3").await);
     }
 
     #[tokio::test]
@@ -599,10 +625,10 @@ mod tests {
         let _ = engine.state.send(EngineState::Ready);
         
         let result = engine.get_or_insert_with("new_item", || async {
-            SyncItem::new("new_item".into(), json!({"created": "by factory"}))
+            SyncItem::from_json("new_item".into(), json!({"created": "by factory"}))
         }).await.expect("get_or_insert_with failed");
         
         assert_eq!(result.object_id, "new_item");
-        assert!(engine.contains("new_item"));
+        assert!(engine.contains("new_item").await);
     }
 }

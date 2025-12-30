@@ -54,7 +54,7 @@ fn mysql_container(docker: &Cli) -> Container<'_, GenericImage> {
 }
 
 fn test_item(id: &str) -> SyncItem {
-    SyncItem::new(id.to_string(), json!({"test": "data", "id": id}))
+    SyncItem::from_json(id.to_string(), json!({"test": "data", "id": id}))
 }
 
 fn unique_wal_path(name: &str) -> String {
@@ -93,7 +93,7 @@ async fn happy_engine_lifecycle_with_redis() {
 
     // Submit items
     for i in 0..10 {
-        let item = SyncItem::new(
+        let item = SyncItem::from_json(
             format!("uk.nhs.patient.record.{}", i),
             json!({
                 "name": format!("Patient {}", i),
@@ -156,9 +156,8 @@ async fn happy_batch_flush_to_redis() {
     // Force flush remaining
     engine.force_flush().await;
 
-    // Verify L2 filter was updated (items written to Redis)
-    let (l2_entries, _, _) = engine.l2_filter_stats();
-    assert!(l2_entries > 0, "L2 filter should have entries after flush");
+    // With Redis-only (no SQL), L3 filter won't have entries.
+    // The key assertion is that items are still retrievable.
 
     // Items still retrievable from L1
     let item = engine.get("batch-item-10").await
@@ -200,7 +199,7 @@ async fn happy_merkle_tree_updates() {
     ];
 
     for id in ids {
-        engine.submit(SyncItem::new(id.to_string(), json!({"id": id}))).await
+        engine.submit(SyncItem::from_json(id.to_string(), json!({"id": id}))).await
             .expect("Failed to submit");
     }
 
@@ -212,7 +211,7 @@ async fn happy_merkle_tree_updates() {
     for id in ids {
         let item = engine.get(id).await
             .expect("Get failed")
-            .expect(&format!("Item {} not found", id));
+            .unwrap_or_else(|| panic!("Item {} not found", id));
         assert_eq!(item.object_id, id);
     }
 
@@ -347,14 +346,14 @@ async fn failure_filter_consistency_on_failed_write() {
     engine.start().await.expect("Should start");
     
     // Check initial filter state
-    let (l2_before, _, _) = engine.l2_filter_stats();
+    let (l3_before, _, _) = engine.l3_filter_stats();
     
     // Submit item (goes to L1 and batch queue, NOT to filter yet)
     engine.submit(test_item("filter-test-item")).await.unwrap();
     
     // Filter should NOT have the item yet (only updated on successful flush)
-    let (l2_after_submit, _, _) = engine.l2_filter_stats();
-    assert_eq!(l2_before, l2_after_submit, "Filter should not update on submit");
+    let (l3_after_submit, _, _) = engine.l3_filter_stats();
+    assert_eq!(l3_before, l3_after_submit, "Filter should not update on submit");
     
     // Kill Redis before flush
     drop(redis);
@@ -364,8 +363,8 @@ async fn failure_filter_consistency_on_failed_write() {
     engine.force_flush().await;
     
     // Filter should still not have the item (write failed)
-    let (l2_after_failed_flush, _, _) = engine.l2_filter_stats();
-    assert_eq!(l2_before, l2_after_failed_flush, 
+    let (l3_after_failed_flush, _, _) = engine.l3_filter_stats();
+    assert_eq!(l3_before, l3_after_failed_flush, 
         "Filter should not update on failed flush");
     
     // Shutdown with timeout (may hang trying to flush to dead Redis)
@@ -536,10 +535,8 @@ async fn happy_full_stack_lifecycle() {
     engine.force_flush().await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Verify filters updated
-    let (l2_entries, _, _) = engine.l2_filter_stats();
+    // Verify filters updated (this test has MySQL, so L3 filter should have entries)
     let (l3_entries, _, _) = engine.l3_filter_stats();
-    println!("L2 (Redis) filter: {} entries", l2_entries);
     println!("L3 (MySQL) filter: {} entries", l3_entries);
 
     // Verify retrieval
@@ -560,13 +557,13 @@ async fn happy_full_stack_lifecycle() {
 
 #[tokio::test]
 #[ignore] // Requires Docker
-async fn coverage_l2_filter_lookup_miss() {
-    // Tests the L2 filter "definitely not in Redis" path
+async fn coverage_redis_lookup_miss() {
+    // Tests the path where an item doesn't exist in any tier
     let docker = Cli::default();
     let redis = redis_container(&docker);
     let redis_port = redis.get_host_port_ipv4(6379);
     
-    let wal_path = unique_wal_path("l2_filter_miss");
+    let wal_path = unique_wal_path("redis_miss");
     let config = SyncEngineConfig {
         redis_url: Some(format!("redis://127.0.0.1:{}", redis_port)),
         sql_url: None,
@@ -580,7 +577,6 @@ async fn coverage_l2_filter_lookup_miss() {
     engine.start().await.expect("Failed to start");
 
     // Query for an ID that was never submitted
-    // L2 filter should say "definitely not here" and skip network hop
     let result = engine.get("nonexistent.item.never.submitted").await
         .expect("Get should not error");
     assert!(result.is_none(), "Should return None for non-existent item");
@@ -668,7 +664,7 @@ async fn coverage_high_pressure_eviction() {
 
     // Submit many items to trigger pressure and eviction
     for i in 0..100 {
-        let item = SyncItem::new(
+        let item = SyncItem::from_json(
             format!("pressure-test-{}", i),
             json!({
                 "data": "x".repeat(200), // ~200 bytes each
@@ -981,8 +977,8 @@ async fn coverage_filter_persistence_restore() {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Get filter stats before shutdown
-        let (l2_entries, _, _) = engine.l2_filter_stats();
-        println!("L2 entries before shutdown: {}", l2_entries);
+        let (l3_entries, _, _) = engine.l3_filter_stats();
+        println!("L2 entries before shutdown: {}", l3_entries);
 
         engine.shutdown().await;
     }
@@ -1000,8 +996,8 @@ async fn coverage_filter_persistence_restore() {
         let mut engine = SyncEngine::new(config, rx);
         
         if engine.start().await.is_ok() {
-            let (l2_entries, _, trust) = engine.l2_filter_stats();
-            println!("L2 entries after restart: {}, trust: {:?}", l2_entries, trust);
+            let (l3_entries, _, trust) = engine.l3_filter_stats();
+            println!("L2 entries after restart: {}, trust: {:?}", l3_entries, trust);
             engine.shutdown().await;
         }
     }
@@ -1044,9 +1040,12 @@ async fn coverage_redis_exists_batch() {
     engine.force_flush().await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Check L2 filter (exercises exists_batch internally during warmup)
-    let (entries, _, _) = engine.l2_filter_stats();
-    assert!(entries > 0, "L2 filter should have entries");
+    // With Redis-only (no SQL), items go to Redis via batch flush.
+    // Verify items are retrievable (exercises Redis EXISTS path)
+    let item = engine.get("exists-5").await
+        .expect("Get should work")
+        .expect("Item should be found");
+    assert_eq!(item.object_id, "exists-5");
 
     engine.shutdown().await;
     let _ = std::fs::remove_file(&wal_path);

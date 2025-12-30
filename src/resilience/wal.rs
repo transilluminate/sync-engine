@@ -343,7 +343,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn test_item(id: &str) -> SyncItem {
-        SyncItem::new(id.to_string(), json!({"test": "data", "id": id}))
+        SyncItem::from_json(id.to_string(), json!({"test": "data", "id": id}))
     }
 
     #[tokio::test]
