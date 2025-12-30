@@ -21,7 +21,7 @@ use super::{SyncEngine, ItemStatus, BatchResult};
 
 impl SyncEngine {
     // ═══════════════════════════════════════════════════════════════════════════
-    // V1.1 API: Query & Batch Operations
+    // API: Query & Batch Operations
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Check if an item exists across all tiers.

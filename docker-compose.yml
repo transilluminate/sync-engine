@@ -1,0 +1,81 @@
+name: sync-engine-test-environment
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: test
+      MYSQL_DATABASE: test
+      MYSQL_USER: test
+      MYSQL_PASSWORD: test
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --max_connections=100
+      - --innodb_buffer_pool_size=256M
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "test", "-ptest"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: "redis/redis-stack:latest"
+    container_name: redis
+    ports:
+      - "6379:6379"
+    command: |
+      redis-server 
+      --save "" 
+      --appendonly no 
+      --maxmemory 100Mb 
+      --maxmemory-policy allkeys-lru 
+      --loglevel notice
+      --protected-mode no
+      --loadmodule /opt/redis-stack/lib/redisearch.so
+    tmpfs:
+      - /data:rw,noexec,nosuid,size=1024
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  redis-insight:
+    image: redis/redisinsight:latest
+    container_name: redis-insight
+    ports:
+      - "5540:5540"
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=""
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - redis_insight_data:/data
+
+  adminer:
+    image: adminer:latest
+    container_name: adminer
+    ports:
+      - "8080:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      - ADMINER_DEFAULT_SERVER=mysql
+      - ADMINER_DESIGN=pepa-linha
+
+volumes:
+  mysql_data:
+  redis_insight_data:

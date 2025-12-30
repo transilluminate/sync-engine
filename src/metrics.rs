@@ -138,6 +138,162 @@ pub fn record_circuit_call(circuit: &str, outcome: &str) {
     .increment(1);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ERROR TRACKING - Categorized error counters for alerting
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Record an error with category for alerting
+pub fn record_error(tier: &str, operation: &str, error_type: &str) {
+    counter!(
+        "sync_engine_errors_total",
+        "tier" => tier.to_string(),
+        "operation" => operation.to_string(),
+        "error_type" => error_type.to_string()
+    )
+    .increment(1);
+}
+
+/// Record a connection/backend error
+pub fn record_connection_error(backend: &str) {
+    counter!(
+        "sync_engine_connection_errors_total",
+        "backend" => backend.to_string()
+    )
+    .increment(1);
+}
+
+/// Record a timeout error
+pub fn record_timeout(tier: &str, operation: &str) {
+    counter!(
+        "sync_engine_timeouts_total",
+        "tier" => tier.to_string(),
+        "operation" => operation.to_string()
+    )
+    .increment(1);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// THROUGHPUT - Bytes and items processed
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Record bytes written to a tier
+pub fn record_bytes_written(tier: &str, bytes: usize) {
+    counter!(
+        "sync_engine_bytes_written_total",
+        "tier" => tier.to_string()
+    )
+    .increment(bytes as u64);
+}
+
+/// Record bytes read from a tier
+pub fn record_bytes_read(tier: &str, bytes: usize) {
+    counter!(
+        "sync_engine_bytes_read_total",
+        "tier" => tier.to_string()
+    )
+    .increment(bytes as u64);
+}
+
+/// Record items written
+pub fn record_items_written(tier: &str, count: usize) {
+    counter!(
+        "sync_engine_items_written_total",
+        "tier" => tier.to_string()
+    )
+    .increment(count as u64);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// QUEUE DEPTHS - Pending work
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Set batch queue depth (items pending flush)
+pub fn set_batch_queue_items(count: usize) {
+    gauge!("sync_engine_batch_queue_items").set(count as f64);
+}
+
+/// Set batch queue size in bytes
+pub fn set_batch_queue_bytes(bytes: usize) {
+    gauge!("sync_engine_batch_queue_bytes").set(bytes as f64);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BACKEND HEALTH - Connection status
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Set backend health status (1 = healthy, 0 = unhealthy)
+pub fn set_backend_healthy(backend: &str, healthy: bool) {
+    gauge!(
+        "sync_engine_backend_healthy",
+        "backend" => backend.to_string()
+    )
+    .set(if healthy { 1.0 } else { 0.0 });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CIRCUIT BREAKER - Resilience metrics
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Record circuit breaker call outcome
+pub fn record_circuit_breaker_call(circuit: &str, outcome: &str) {
+    counter!(
+        "sync_engine_circuit_breaker_calls_total",
+        "circuit" => circuit.to_string(),
+        "outcome" => outcome.to_string()
+    )
+    .increment(1);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CUCKOO FILTER - Accuracy tracking
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Record cuckoo filter false positive
+pub fn record_cuckoo_false_positive(filter: &str) {
+    counter!(
+        "sync_engine_cuckoo_false_positive_total",
+        "filter" => filter.to_string()
+    )
+    .increment(1);
+}
+
+/// Record cuckoo filter check
+pub fn record_cuckoo_check(filter: &str, result: &str) {
+    counter!(
+        "sync_engine_cuckoo_checks_total",
+        "filter" => filter.to_string(),
+        "result" => result.to_string()
+    )
+    .increment(1);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STARTUP - Timing for cold start monitoring
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Record startup phase duration
+pub fn record_startup_phase(phase: &str, duration: Duration) {
+    histogram!(
+        "sync_engine_startup_seconds",
+        "phase" => phase.to_string()
+    )
+    .record(duration.as_secs_f64());
+}
+
+/// Record total startup time
+pub fn record_startup_total(duration: Duration) {
+    histogram!("sync_engine_startup_total_seconds").record(duration.as_secs_f64());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BATCH FLUSH - Detailed flush metrics
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Record batch flush duration
+pub fn record_flush_duration(duration: Duration) {
+    histogram!("sync_engine_flush_seconds").record(duration.as_secs_f64());
+}
+
 /// Set engine state (for monitoring state machine transitions)
 pub fn set_engine_state(state: &str) {
     // Use a simple counter to track state transitions

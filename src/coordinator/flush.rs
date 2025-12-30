@@ -144,6 +144,7 @@ impl SyncEngine {
     /// - All items with same options go in one Redis pipeline
     /// - All items with same options go in one SQL batch INSERT
     pub(super) async fn flush_batch_internal(&self, batch: FlushBatch<SyncItem>) {
+        let flush_start = std::time::Instant::now();
         let batch_size = batch.items.len();
         debug!(batch_size = batch_size, reason = ?batch.reason, "Flushing batch");
         
@@ -160,28 +161,36 @@ impl SyncEngine {
         // ====== Flush each group ======
         let mut total_l2_success = 0;
         let mut total_l2_errors = 0;
+        let mut total_l2_bytes = 0usize;
         let mut total_l3_success = 0;
+        let mut total_l3_bytes = 0usize;
         let mut total_wal_fallback = 0;
         let mut all_items: Vec<SyncItem> = Vec::with_capacity(batch_size);
         
         for (options_key, mut items) in groups {
             let options = options_key.to_options();
             let group_size = items.len();
+            let group_bytes: usize = items.iter().map(|i| i.content.len()).sum();
             
             // ====== L2: Pipelined Redis writes (if enabled for this group) ======
             if options.redis {
                 if let Some(ref l2) = self.l2_store {
+                    let l2_start = std::time::Instant::now();
                     // Get TTL in seconds from CacheTtl enum
                     let ttl_secs = options.redis_ttl.as_ref().map(|ttl| ttl.to_duration().as_secs());
                     match l2.put_batch_with_ttl(&items, ttl_secs).await {
                         Ok(result) => {
                             total_l2_success += result.written;
+                            total_l2_bytes += group_bytes;
+                            crate::metrics::record_latency("L2", "batch_write", l2_start.elapsed());
                             // Note: No L2 filter - TTL makes filters untrustworthy
                             debug!(written = result.written, ttl = ?ttl_secs, "L2 group write complete");
                         }
                         Err(e) => {
                             warn!(error = %e, group_size, "L2 group write failed");
                             total_l2_errors += group_size;
+                            crate::metrics::record_error("L2", "batch_write", "backend");
+                            crate::metrics::record_connection_error("redis");
                         }
                     }
                 }
@@ -191,26 +200,35 @@ impl SyncEngine {
             if options.sql {
                 if self.mysql_health.is_healthy() {
                     if let Some(ref l3) = self.l3_store {
+                        let l3_start = std::time::Instant::now();
                         match l3.put_batch(&mut items).await {
                             Ok(result) => {
                                 total_l3_success += result.written;
+                                total_l3_bytes += group_bytes;
+                                crate::metrics::record_latency("L3", "batch_write", l3_start.elapsed());
                                 if result.verified {
                                     for item in &items {
                                         self.l3_filter.insert(&item.object_id);
                                     }
                                     self.mysql_health.record_success();
+                                    crate::metrics::set_backend_healthy("mysql", true);
                                     debug!(batch_id = %result.batch_id, written = result.written, "L3 group write verified");
                                 } else {
                                     warn!(batch_id = %result.batch_id, "L3 group verification failed");
+                                    crate::metrics::record_error("L3", "batch_write", "verification");
                                 }
                             }
                             Err(e) => {
                                 warn!(error = %e, group_size, "L3 group write failed, falling back to WAL");
                                 self.mysql_health.record_failure();
+                                crate::metrics::record_error("L3", "batch_write", "backend");
+                                crate::metrics::record_connection_error("mysql");
+                                crate::metrics::set_backend_healthy("mysql", false);
                                 if let Some(ref wal) = self.l3_wal {
                                     for item in &items {
                                         if let Err(e) = wal.write(item).await {
                                             warn!(id = %item.object_id, error = %e, "WAL write also failed!");
+                                            crate::metrics::record_error("WAL", "write", "io");
                                         } else {
                                             total_wal_fallback += 1;
                                         }
@@ -220,9 +238,12 @@ impl SyncEngine {
                         }
                     }
                 } else if let Some(ref wal) = self.l3_wal {
+                    // MySQL unhealthy - write directly to WAL
+                    crate::metrics::set_backend_healthy("mysql", false);
                     for item in &items {
                         if let Err(e) = wal.write(item).await {
                             warn!(id = %item.object_id, error = %e, "WAL write failed!");
+                            crate::metrics::record_error("WAL", "write", "io");
                         } else {
                             total_wal_fallback += 1;
                         }
@@ -261,10 +282,43 @@ impl SyncEngine {
             if let Some(ref redis_merkle) = self.redis_merkle {
                 if let Err(e) = redis_merkle.apply_batch(&merkle_batch).await {
                     warn!(error = %e, "Failed to update Redis Merkle tree (cache)");
+                    crate::metrics::record_error("merkle", "redis_update", "backend");
                 } else {
                     debug!(merkle_updates = merkle_batch.len(), "Redis merkle tree updated");
+                    crate::metrics::record_merkle_operation("redis", "batch_update", true);
                 }
             }
+        }
+        
+        // Record comprehensive metrics for OTEL export
+        let flush_duration = flush_start.elapsed();
+        crate::metrics::record_flush_duration(flush_duration);
+        
+        // Batch sizes
+        crate::metrics::record_batch_size("L2", total_l2_success);
+        crate::metrics::record_batch_size("L3", total_l3_success);
+        crate::metrics::record_batch_bytes("L2", total_l2_bytes);
+        crate::metrics::record_batch_bytes("L3", total_l3_bytes);
+        
+        // Throughput
+        crate::metrics::record_bytes_written("L2", total_l2_bytes);
+        crate::metrics::record_bytes_written("L3", total_l3_bytes);
+        crate::metrics::record_items_written("L2", total_l2_success);
+        crate::metrics::record_items_written("L3", total_l3_success);
+        
+        // Operation outcomes
+        if total_l2_success > 0 {
+            crate::metrics::record_operation("L2", "batch_write", "success");
+        }
+        if total_l2_errors > 0 {
+            crate::metrics::record_operation("L2", "batch_write", "error");
+        }
+        if total_l3_success > 0 {
+            crate::metrics::record_operation("L3", "batch_write", "success");
+        }
+        if total_wal_fallback > 0 {
+            crate::metrics::record_operation("WAL", "fallback", "success");
+            crate::metrics::record_items_written("WAL", total_wal_fallback);
         }
         
         info!(
@@ -273,6 +327,7 @@ impl SyncEngine {
             l3_success = total_l3_success, 
             wal_fallback = total_wal_fallback, 
             groups = group_count,
+            flush_ms = flush_duration.as_millis(),
             reason = ?batch.reason, 
             "Batch flush complete"
         );

@@ -173,16 +173,19 @@ impl CircuitBreaker {
             Ok(result) => {
                 self.successes.fetch_add(1, Ordering::Relaxed);
                 debug!(circuit = %self.name, "Circuit call succeeded");
+                crate::metrics::record_circuit_breaker_call(&self.name, "success");
                 Ok(result)
             }
             Err(RecloserError::Rejected) => {
                 self.rejections.fetch_add(1, Ordering::Relaxed);
                 warn!(circuit = %self.name, "Circuit breaker rejected call (open)");
+                crate::metrics::record_circuit_breaker_call(&self.name, "rejected");
                 Err(CircuitError::Rejected)
             }
             Err(RecloserError::Inner(e)) => {
                 self.failures.fetch_add(1, Ordering::Relaxed);
                 debug!(circuit = %self.name, "Circuit call failed");
+                crate::metrics::record_circuit_breaker_call(&self.name, "failure");
                 Err(CircuitError::Inner(e))
             }
         }

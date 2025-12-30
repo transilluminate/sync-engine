@@ -31,10 +31,12 @@ impl SyncEngine {
     /// 8. Ready!
     #[tracing::instrument(skip(self), fields(has_redis, has_sql))]
     pub async fn start(&mut self) -> Result<(), StorageError> {
+        let startup_start = std::time::Instant::now();
         info!("Starting sync engine with trust-verified startup...");
         let _ = self.state.send(EngineState::Connecting);
 
         // ========== PHASE 1: Initialize WAL (always first) ==========
+        let phase_start = std::time::Instant::now();
         let wal_path = self.config.wal_path.clone()
             .unwrap_or_else(|| "./sync_engine_wal.db".to_string());
         let wal_max_items = self.config.wal_max_items.unwrap_or(1_000_000);
@@ -42,9 +44,11 @@ impl SyncEngine {
         let wal = match WriteAheadLog::new(&wal_path, wal_max_items).await {
             Ok(wal) => {
                 info!(path = %wal_path, "Write-ahead log initialized");
+                crate::metrics::record_startup_phase("wal_init", phase_start.elapsed());
                 wal
             }
             Err(e) => {
+                crate::metrics::record_error("WAL", "init", "sqlite");
                 return Err(StorageError::Backend(format!(
                     "Failed to initialize WAL at {}: {}. Cannot guarantee durability!",
                     wal_path, e
@@ -59,6 +63,7 @@ impl SyncEngine {
             }
             Err(e) => {
                 warn!(error = %e, "Failed to initialize filter persistence - CF snapshots disabled");
+                crate::metrics::record_error("filter", "init", "persistence");
             }
         }
         
@@ -70,6 +75,7 @@ impl SyncEngine {
         self.l3_wal = Some(wal);
 
         // ========== PHASE 2: Connect to SQL (L3 - ground truth) ==========
+        let phase_start = std::time::Instant::now();
         if let Some(ref sql_url) = self.config.sql_url {
             info!(url = %sql_url, "Connecting to SQL (L3 - ground truth)...");
             match crate::storage::sql::SqlStore::new(sql_url).await {
@@ -79,6 +85,7 @@ impl SyncEngine {
                     let sql_merkle = SqlMerkleStore::from_pool(store.pool(), is_sqlite);
                     if let Err(e) = sql_merkle.init_schema().await {
                         error!(error = %e, "Failed to initialize SQL merkle schema");
+                        crate::metrics::record_error("L3", "init", "merkle_schema");
                         return Err(StorageError::Backend(format!(
                             "Failed to initialize SQL merkle schema: {}", e
                         )));
@@ -88,12 +95,16 @@ impl SyncEngine {
                     self.l3_store = Some(std::sync::Arc::new(store));
                     tracing::Span::current().record("has_sql", true);
                     self.mysql_health.record_success();
+                    crate::metrics::set_backend_healthy("mysql", true);
+                    crate::metrics::record_startup_phase("sql_connect", phase_start.elapsed());
                     info!("SQL (L3) connected with merkle store (ground truth)");
                 }
                 Err(e) => {
                     tracing::Span::current().record("has_sql", false);
                     error!(error = %e, "Failed to connect to SQL - this is required for startup");
                     self.mysql_health.record_failure();
+                    crate::metrics::set_backend_healthy("mysql", false);
+                    crate::metrics::record_connection_error("mysql");
                     return Err(StorageError::Backend(format!(
                         "SQL connection required for startup: {}", e
                     )));
@@ -106,6 +117,7 @@ impl SyncEngine {
 
         // ========== PHASE 3: Drain WAL to SQL ==========
         if pending_count > 0 {
+            let phase_start = std::time::Instant::now();
             let _ = self.state.send(EngineState::DrainingWal);
             info!(pending = pending_count, "Draining WAL to SQL before startup...");
             
@@ -114,13 +126,16 @@ impl SyncEngine {
                     match wal.drain_to(l3.as_ref(), pending_count as usize).await {
                         Ok(drained) => {
                             info!(drained = drained.len(), "WAL drained to SQL");
+                            crate::metrics::record_items_written("L3", drained.len());
                         }
                         Err(e) => {
                             warn!(error = %e, "WAL drain had errors - some items may retry later");
+                            crate::metrics::record_error("WAL", "drain", "partial");
                         }
                     }
                 }
             }
+            crate::metrics::record_startup_phase("wal_drain", phase_start.elapsed());
         }
         
         // ========== PHASE 4: Get SQL merkle root (trusted root) ==========
@@ -144,9 +159,12 @@ impl SyncEngine {
         };
         
         // ========== PHASE 5: Restore CF from snapshot (if valid) ==========
+        let phase_start = std::time::Instant::now();
         self.restore_cuckoo_filters(&sql_root).await;
+        crate::metrics::record_startup_phase("cf_restore", phase_start.elapsed());
 
         // ========== PHASE 6: Connect to Redis (L2 - cache) ==========
+        let phase_start = std::time::Instant::now();
         if let Some(ref redis_url) = self.config.redis_url {
             info!(url = %redis_url, "Connecting to Redis (L2 - cache)...");
             match crate::storage::redis::RedisStore::new(redis_url).await {
@@ -155,11 +173,15 @@ impl SyncEngine {
                     self.redis_merkle = Some(redis_merkle);
                     self.l2_store = Some(std::sync::Arc::new(store));
                     tracing::Span::current().record("has_redis", true);
+                    crate::metrics::set_backend_healthy("redis", true);
+                    crate::metrics::record_startup_phase("redis_connect", phase_start.elapsed());
                     info!("Redis (L2) connected with merkle shadow tree");
                 }
                 Err(e) => {
                     tracing::Span::current().record("has_redis", false);
                     warn!(error = %e, "Failed to connect to Redis, continuing without L2 cache");
+                    crate::metrics::set_backend_healthy("redis", false);
+                    crate::metrics::record_connection_error("redis");
                 }
             }
         } else {
@@ -170,6 +192,7 @@ impl SyncEngine {
         if let (Some(ref sql_merkle), Some(ref redis_merkle), Some(ref sql_root)) = 
             (&self.sql_merkle, &self.redis_merkle, &sql_root) 
         {
+            let phase_start = std::time::Instant::now();
             let _ = self.state.send(EngineState::SyncingRedis);
             
             match redis_merkle.root_hash().await {
@@ -186,9 +209,11 @@ impl SyncEngine {
                     match self.sync_redis_from_sql_diff(sql_merkle, redis_merkle).await {
                         Ok(synced) => {
                             info!(items_synced = synced, "Redis sync complete via branch diff");
+                            crate::metrics::record_items_written("L2", synced);
                         }
                         Err(e) => {
                             warn!(error = %e, "Branch diff sync failed - Redis may be stale");
+                            crate::metrics::record_error("L2", "sync", "branch_diff");
                         }
                     }
                 }
@@ -197,11 +222,14 @@ impl SyncEngine {
                 }
                 Err(e) => {
                     warn!(error = %e, "Failed to get Redis merkle root - Redis may be stale");
+                    crate::metrics::record_error("L2", "merkle", "root_hash");
                 }
             }
+            crate::metrics::record_startup_phase("redis_sync", phase_start.elapsed());
         }
 
         let _ = self.state.send(EngineState::Ready);
+        crate::metrics::record_startup_total(startup_start.elapsed());
         info!("Sync engine ready (trust-verified startup complete)");
         Ok(())
     }
@@ -442,21 +470,27 @@ impl SyncEngine {
     /// Initiate graceful shutdown
     #[tracing::instrument(skip(self))]
     pub async fn shutdown(&mut self) {
+        use crate::FlushReason;
+        
+        let shutdown_start = std::time::Instant::now();
         info!("Initiating sync engine shutdown...");
         let _ = self.state.send(EngineState::ShuttingDown);
         
-        let batch = self.l2_batcher.lock().await.force_flush();
+        let batch = self.l2_batcher.lock().await.force_flush_with_reason(FlushReason::Shutdown);
         if let Some(batch) = batch {
-            info!(batch_size = batch.items.len(), "Flushing final L2 batch on shutdown");
+            let batch_size = batch.items.len();
+            info!(batch_size, "Flushing final L2 batch on shutdown");
             {
                 let mut batcher = self.l2_batcher.lock().await;
                 batcher.add_batch(batch.items);
             }
             self.maybe_flush_l2().await;
+            crate::metrics::record_items_written("L2", batch_size);
         }
         
         self.snapshot_cuckoo_filters("shutdown").await;
         
+        crate::metrics::record_startup_phase("shutdown", shutdown_start.elapsed());
         info!("Sync engine shutdown complete");
     }
 }

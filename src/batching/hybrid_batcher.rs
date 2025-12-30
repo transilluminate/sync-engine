@@ -218,8 +218,13 @@ impl<T: SizedItem> HybridBatcher<T> {
         })
     }
     
-    /// Force flush regardless of thresholds (for shutdown)
+    /// Force flush regardless of thresholds (for manual flush or shutdown)
     pub fn force_flush(&mut self) -> Option<FlushBatch<T>> {
+        self.force_flush_with_reason(FlushReason::Manual)
+    }
+    
+    /// Force flush with a specific reason
+    pub fn force_flush_with_reason(&mut self, reason: FlushReason) -> Option<FlushBatch<T>> {
         if self.batch.is_empty() {
             return None;
         }
@@ -228,7 +233,7 @@ impl<T: SizedItem> HybridBatcher<T> {
         Some(FlushBatch {
             items: self.batch.take(),
             total_bytes,
-            reason: FlushReason::Shutdown,
+            reason,
         })
     }
 }
@@ -393,13 +398,18 @@ mod tests {
         let batch = batcher.force_flush().unwrap();
         assert_eq!(batch.items.len(), 2);
         assert_eq!(batch.total_bytes, 300);
-        assert_eq!(batch.reason, FlushReason::Shutdown);
+        assert_eq!(batch.reason, FlushReason::Manual);
         
         // Should be empty now
         assert!(batcher.is_empty());
         
         // Force flush on empty returns None
         assert!(batcher.force_flush().is_none());
+        
+        // Test force_flush_with_reason
+        batcher.add(item("c", 100));
+        let batch = batcher.force_flush_with_reason(FlushReason::Shutdown).unwrap();
+        assert_eq!(batch.reason, FlushReason::Shutdown);
     }
 
     #[test]
