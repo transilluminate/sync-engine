@@ -1,8 +1,12 @@
 target/
 config/
 reference/
+temp/*
+!temp/.gitkeep
 Cargo.lock
 *.rs.bk
 *.log
 .DS_Store
 *.db
+*.db-wal
+*.db-shm

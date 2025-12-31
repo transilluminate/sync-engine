@@ -954,6 +954,121 @@ impl SqlStore {
         
         Ok(result.rows_affected())
     }
+    
+    /// Scan items by ID prefix.
+    ///
+    /// Efficiently retrieves all items whose ID starts with the given prefix.
+    /// Uses SQL `LIKE 'prefix%'` which leverages the primary key index.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// // Get all deltas for object user.123
+    /// let deltas = store.scan_prefix("delta:user.123:", 1000).await?;
+    /// ```
+    pub async fn scan_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<SyncItem>, StorageError> {
+        // Build LIKE pattern: "prefix%"
+        let pattern = format!("{}%", prefix);
+        
+        let rows = sqlx::query(
+            "SELECT id, version, timestamp, payload_hash, payload, payload_blob, audit, state 
+             FROM sync_items WHERE id LIKE ? ORDER BY id LIMIT ?"
+        )
+            .bind(&pattern)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Backend(format!("Failed to scan by prefix: {}", e)))?;
+        
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get("id")
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            let version: i64 = row.try_get("version").unwrap_or(1);
+            let timestamp: i64 = row.try_get("timestamp").unwrap_or(0);
+            let payload_hash: Option<String> = row.try_get("payload_hash").ok();
+            
+            // Try reading payload as String first (SQLite TEXT), then as bytes (MySQL LONGTEXT)
+            let payload_json: Option<String> = row.try_get::<String, _>("payload").ok()
+                .or_else(|| {
+                    row.try_get::<Vec<u8>, _>("payload").ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                });
+            
+            let payload_blob: Option<Vec<u8>> = row.try_get("payload_blob").ok();
+            
+            // Try reading audit as String first (SQLite), then bytes (MySQL)
+            let audit_json: Option<String> = row.try_get::<String, _>("audit").ok()
+                .or_else(|| {
+                    row.try_get::<Vec<u8>, _>("audit").ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                });
+            
+            // State field - try String first (SQLite), then bytes (MySQL)
+            let state: String = row.try_get::<String, _>("state").ok()
+                .or_else(|| {
+                    row.try_get::<Vec<u8>, _>("state").ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                })
+                .unwrap_or_else(|| "default".to_string());
+            
+            let (content, content_type) = if let Some(ref json_str) = payload_json {
+                (json_str.as_bytes().to_vec(), ContentType::Json)
+            } else if let Some(blob) = payload_blob {
+                (blob, ContentType::Binary)
+            } else {
+                continue;
+            };
+            
+            let (batch_id, trace_parent, home_instance_id) = Self::parse_audit_json(audit_json);
+            
+            let item = SyncItem::reconstruct(
+                id,
+                version as u64,
+                timestamp,
+                content_type,
+                content,
+                batch_id,
+                trace_parent,
+                payload_hash.unwrap_or_default(),
+                home_instance_id,
+                state,
+            );
+            items.push(item);
+        }
+        
+        Ok(items)
+    }
+    
+    /// Count items matching an ID prefix.
+    pub async fn count_prefix(&self, prefix: &str) -> Result<u64, StorageError> {
+        let pattern = format!("{}%", prefix);
+        
+        let result = sqlx::query("SELECT COUNT(*) as cnt FROM sync_items WHERE id LIKE ?")
+            .bind(&pattern)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        
+        let count: i64 = result.try_get("cnt")
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        
+        Ok(count as u64)
+    }
+    
+    /// Delete all items matching an ID prefix.
+    ///
+    /// Returns the number of deleted items.
+    pub async fn delete_prefix(&self, prefix: &str) -> Result<u64, StorageError> {
+        let pattern = format!("{}%", prefix);
+        
+        let result = sqlx::query("DELETE FROM sync_items WHERE id LIKE ?")
+            .bind(&pattern)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        
+        Ok(result.rows_affected())
+    }
 }
 
 #[cfg(test)]
@@ -963,7 +1078,15 @@ mod tests {
     use serde_json::json;
     
     fn temp_db_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("sql_state_test_{}.db", name))
+        // Use local temp/ folder (gitignored) instead of system temp
+        PathBuf::from("temp").join(format!("sql_test_{}.db", name))
+    }
+    
+    /// Clean up SQLite database and its WAL files
+    fn cleanup_db(path: &PathBuf) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
     
     fn test_item(id: &str, state: &str) -> SyncItem {
@@ -974,7 +1097,7 @@ mod tests {
     #[tokio::test]
     async fn test_state_stored_and_retrieved() {
         let db_path = temp_db_path("stored");
-        let _ = std::fs::remove_file(&db_path);
+        cleanup_db(&db_path);
         
         let url = format!("sqlite://{}?mode=rwc", db_path.display());
         let store = SqlStore::new(&url).await.unwrap();
@@ -987,13 +1110,13 @@ mod tests {
         let retrieved = store.get("item1").await.unwrap().unwrap();
         assert_eq!(retrieved.state, "delta");
         
-        let _ = std::fs::remove_file(&db_path);
+        cleanup_db(&db_path);
     }
 
     #[tokio::test]
     async fn test_state_default_value() {
         let db_path = temp_db_path("default");
-        let _ = std::fs::remove_file(&db_path);
+        cleanup_db(&db_path);
         
         let url = format!("sqlite://{}?mode=rwc", db_path.display());
         let store = SqlStore::new(&url).await.unwrap();
@@ -1005,13 +1128,13 @@ mod tests {
         let retrieved = store.get("item1").await.unwrap().unwrap();
         assert_eq!(retrieved.state, "default");
         
-        let _ = std::fs::remove_file(&db_path);
+        cleanup_db(&db_path);
     }
 
     #[tokio::test]
     async fn test_get_by_state() {
         let db_path = temp_db_path("get_by_state");
-        let _ = std::fs::remove_file(&db_path);
+        cleanup_db(&db_path);
         
         let url = format!("sqlite://{}?mode=rwc", db_path.display());
         let store = SqlStore::new(&url).await.unwrap();
@@ -1035,13 +1158,13 @@ mod tests {
         let none = store.get_by_state("nonexistent", 100).await.unwrap();
         assert!(none.is_empty());
         
-        let _ = std::fs::remove_file(&db_path);
+        cleanup_db(&db_path);
     }
 
     #[tokio::test]
     async fn test_get_by_state_with_limit() {
         let db_path = temp_db_path("get_by_state_limit");
-        let _ = std::fs::remove_file(&db_path);
+        cleanup_db(&db_path);
         
         let url = format!("sqlite://{}?mode=rwc", db_path.display());
         let store = SqlStore::new(&url).await.unwrap();
@@ -1055,13 +1178,13 @@ mod tests {
         let limited = store.get_by_state("batch", 5).await.unwrap();
         assert_eq!(limited.len(), 5);
         
-        let _ = std::fs::remove_file(&db_path);
+        cleanup_db(&db_path);
     }
 
     #[tokio::test]
     async fn test_count_by_state() {
         let db_path = temp_db_path("count_by_state");
-        let _ = std::fs::remove_file(&db_path);
+        cleanup_db(&db_path);
         
         let url = format!("sqlite://{}?mode=rwc", db_path.display());
         let store = SqlStore::new(&url).await.unwrap();
@@ -1076,13 +1199,13 @@ mod tests {
         assert_eq!(store.count_by_state("beta").await.unwrap(), 1);
         assert_eq!(store.count_by_state("gamma").await.unwrap(), 0);
         
-        let _ = std::fs::remove_file(&db_path);
+        cleanup_db(&db_path);
     }
 
     #[tokio::test]
     async fn test_list_state_ids() {
         let db_path = temp_db_path("list_state_ids");
-        let _ = std::fs::remove_file(&db_path);
+        cleanup_db(&db_path);
         
         let url = format!("sqlite://{}?mode=rwc", db_path.display());
         let store = SqlStore::new(&url).await.unwrap();
@@ -1096,13 +1219,13 @@ mod tests {
         assert!(pending_ids.contains(&"id1".to_string()));
         assert!(pending_ids.contains(&"id2".to_string()));
         
-        let _ = std::fs::remove_file(&db_path);
+        cleanup_db(&db_path);
     }
 
     #[tokio::test]
     async fn test_set_state() {
         let db_path = temp_db_path("set_state");
-        let _ = std::fs::remove_file(&db_path);
+        cleanup_db(&db_path);
         
         let url = format!("sqlite://{}?mode=rwc", db_path.display());
         let store = SqlStore::new(&url).await.unwrap();
@@ -1125,13 +1248,13 @@ mod tests {
         let not_found = store.set_state("nonexistent", "x").await.unwrap();
         assert!(!not_found);
         
-        let _ = std::fs::remove_file(&db_path);
+        cleanup_db(&db_path);
     }
 
     #[tokio::test]
     async fn test_delete_by_state() {
         let db_path = temp_db_path("delete_by_state");
-        let _ = std::fs::remove_file(&db_path);
+        cleanup_db(&db_path);
         
         let url = format!("sqlite://{}?mode=rwc", db_path.display());
         let store = SqlStore::new(&url).await.unwrap();
@@ -1158,13 +1281,13 @@ mod tests {
         let zero = store.delete_by_state("nonexistent").await.unwrap();
         assert_eq!(zero, 0);
         
-        let _ = std::fs::remove_file(&db_path);
+        cleanup_db(&db_path);
     }
 
     #[tokio::test]
     async fn test_multiple_puts_preserve_state() {
         let db_path = temp_db_path("multi_put_state");
-        let _ = std::fs::remove_file(&db_path);
+        cleanup_db(&db_path);
         
         let url = format!("sqlite://{}?mode=rwc", db_path.display());
         let store = SqlStore::new(&url).await.unwrap();
@@ -1178,6 +1301,131 @@ mod tests {
         assert_eq!(store.get("b").await.unwrap().unwrap().state, "state_b");
         assert_eq!(store.get("c").await.unwrap().unwrap().state, "state_c");
         
-        let _ = std::fs::remove_file(&db_path);
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn test_scan_prefix() {
+        let db_path = temp_db_path("scan_prefix");
+        cleanup_db(&db_path);
+        
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let store = SqlStore::new(&url).await.unwrap();
+        
+        // Insert items with different prefixes (CRDT pattern)
+        store.put(&test_item("delta:user.123:op001", "delta")).await.unwrap();
+        store.put(&test_item("delta:user.123:op002", "delta")).await.unwrap();
+        store.put(&test_item("delta:user.123:op003", "delta")).await.unwrap();
+        store.put(&test_item("delta:user.456:op001", "delta")).await.unwrap();
+        store.put(&test_item("base:user.123", "base")).await.unwrap();
+        store.put(&test_item("base:user.456", "base")).await.unwrap();
+        
+        // Scan specific object's deltas
+        let user123_deltas = store.scan_prefix("delta:user.123:", 100).await.unwrap();
+        assert_eq!(user123_deltas.len(), 3);
+        assert!(user123_deltas.iter().all(|i| i.object_id.starts_with("delta:user.123:")));
+        
+        // Scan different object
+        let user456_deltas = store.scan_prefix("delta:user.456:", 100).await.unwrap();
+        assert_eq!(user456_deltas.len(), 1);
+        
+        // Scan all deltas
+        let all_deltas = store.scan_prefix("delta:", 100).await.unwrap();
+        assert_eq!(all_deltas.len(), 4);
+        
+        // Scan all bases
+        let bases = store.scan_prefix("base:", 100).await.unwrap();
+        assert_eq!(bases.len(), 2);
+        
+        // Empty result for non-matching prefix
+        let none = store.scan_prefix("nonexistent:", 100).await.unwrap();
+        assert!(none.is_empty());
+        
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn test_scan_prefix_with_limit() {
+        let db_path = temp_db_path("scan_prefix_limit");
+        cleanup_db(&db_path);
+        
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let store = SqlStore::new(&url).await.unwrap();
+        
+        // Insert 20 items
+        for i in 0..20 {
+            store.put(&test_item(&format!("delta:obj:op{:03}", i), "delta")).await.unwrap();
+        }
+        
+        // Query with limit
+        let limited = store.scan_prefix("delta:obj:", 5).await.unwrap();
+        assert_eq!(limited.len(), 5);
+        
+        // Verify we can get all with larger limit
+        let all = store.scan_prefix("delta:obj:", 100).await.unwrap();
+        assert_eq!(all.len(), 20);
+        
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn test_count_prefix() {
+        let db_path = temp_db_path("count_prefix");
+        cleanup_db(&db_path);
+        
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let store = SqlStore::new(&url).await.unwrap();
+        
+        // Insert items with different prefixes
+        store.put(&test_item("delta:user.123:op001", "delta")).await.unwrap();
+        store.put(&test_item("delta:user.123:op002", "delta")).await.unwrap();
+        store.put(&test_item("delta:user.123:op003", "delta")).await.unwrap();
+        store.put(&test_item("delta:user.456:op001", "delta")).await.unwrap();
+        store.put(&test_item("base:user.123", "base")).await.unwrap();
+        
+        // Count by prefix
+        assert_eq!(store.count_prefix("delta:user.123:").await.unwrap(), 3);
+        assert_eq!(store.count_prefix("delta:user.456:").await.unwrap(), 1);
+        assert_eq!(store.count_prefix("delta:").await.unwrap(), 4);
+        assert_eq!(store.count_prefix("base:").await.unwrap(), 1);
+        assert_eq!(store.count_prefix("nonexistent:").await.unwrap(), 0);
+        
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn test_delete_prefix() {
+        let db_path = temp_db_path("delete_prefix");
+        cleanup_db(&db_path);
+        
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let store = SqlStore::new(&url).await.unwrap();
+        
+        // Insert items with different prefixes
+        store.put(&test_item("delta:user.123:op001", "delta")).await.unwrap();
+        store.put(&test_item("delta:user.123:op002", "delta")).await.unwrap();
+        store.put(&test_item("delta:user.123:op003", "delta")).await.unwrap();
+        store.put(&test_item("delta:user.456:op001", "delta")).await.unwrap();
+        store.put(&test_item("base:user.123", "base")).await.unwrap();
+        
+        // Delete one object's deltas
+        let deleted = store.delete_prefix("delta:user.123:").await.unwrap();
+        assert_eq!(deleted, 3);
+        
+        // Verify deleted
+        assert!(store.get("delta:user.123:op001").await.unwrap().is_none());
+        assert!(store.get("delta:user.123:op002").await.unwrap().is_none());
+        
+        // Verify other deltas remain
+        assert!(store.get("delta:user.456:op001").await.unwrap().is_some());
+        
+        // Verify bases remain
+        assert!(store.get("base:user.123").await.unwrap().is_some());
+        
+        // Delete non-existent prefix returns 0
+        let zero = store.delete_prefix("nonexistent:").await.unwrap();
+        assert_eq!(zero, 0);
+        
+        cleanup_db(&db_path);
     }
 }

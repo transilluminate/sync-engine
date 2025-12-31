@@ -220,7 +220,15 @@ fn test_item(id: &str) -> SyncItem {
 }
 
 fn unique_wal_path(name: &str) -> String {
-    format!("./test_wal_chaos_{}_{}.db", name, uuid::Uuid::new_v4())
+    // Use temp/ folder to keep root clean
+    format!("./temp/test_wal_chaos_{}_{}.db", name, uuid::Uuid::new_v4())
+}
+
+/// Clean up WAL file and its associated SQLite journal files (-shm, -wal)
+fn cleanup_wal_files(wal_path: &str) {
+    let _ = std::fs::remove_file(wal_path);
+    let _ = std::fs::remove_file(format!("{}-shm", wal_path));
+    let _ = std::fs::remove_file(format!("{}-wal", wal_path));
 }
 
 // =============================================================================
@@ -280,7 +288,7 @@ async fn chaos_redis_killed_during_batch_write() {
     assert_eq!(item.object_id, "batch-kill-25");
     
     let _ = tokio::time::timeout(Duration::from_secs(2), eng.shutdown()).await;
-    let _ = std::fs::remove_file(&wal_path);
+    cleanup_wal_files(&wal_path);
 }
 
 #[tokio::test]
@@ -345,7 +353,7 @@ async fn chaos_mysql_killed_triggers_wal_fallback() {
     assert!(std::path::Path::new(&wal_path).exists(), "WAL file should exist");
     
     let _ = tokio::time::timeout(Duration::from_secs(2), engine.shutdown()).await;
-    let _ = std::fs::remove_file(&wal_path);
+    cleanup_wal_files(&wal_path);
 }
 
 // =============================================================================
@@ -414,7 +422,7 @@ async fn chaos_corrupted_redis_data() {
     assert_eq!(item.object_id, "after-corrupt");
     
     engine.shutdown().await;
-    let _ = std::fs::remove_file(&wal_path);
+    cleanup_wal_files(&wal_path);
 }
 
 #[tokio::test]
@@ -461,7 +469,7 @@ async fn chaos_partial_json_in_redis() {
     }
     
     engine.shutdown().await;
-    let _ = std::fs::remove_file(&wal_path);
+    cleanup_wal_files(&wal_path);
 }
 
 // =============================================================================
@@ -499,7 +507,7 @@ async fn chaos_double_start() {
     // Should either succeed (no-op) or return an error, NOT panic
     
     engine.shutdown().await;
-    let _ = std::fs::remove_file(&wal_path);
+    cleanup_wal_files(&wal_path);
 }
 
 #[tokio::test]
@@ -525,7 +533,7 @@ async fn chaos_shutdown_without_start() {
     engine.shutdown().await;
     
     assert_eq!(engine.state(), EngineState::ShuttingDown);
-    let _ = std::fs::remove_file(&wal_path);
+    cleanup_wal_files(&wal_path);
 }
 
 #[tokio::test]
@@ -563,7 +571,7 @@ async fn chaos_operations_after_shutdown() {
     let get_result = engine.get("before-shutdown").await;
     println!("Get after shutdown: {:?}", get_result);
     
-    let _ = std::fs::remove_file(&wal_path);
+    cleanup_wal_files(&wal_path);
 }
 
 // =============================================================================
@@ -640,7 +648,7 @@ async fn chaos_concurrent_submits_during_redis_death() {
         engine.lock().await.shutdown().await;
     }).await;
     
-    let _ = std::fs::remove_file(&wal_path);
+    cleanup_wal_files(&wal_path);
 }
 
 #[tokio::test]
@@ -672,7 +680,7 @@ async fn chaos_rapid_start_stop_cycles() {
         
         engine.shutdown().await;
         
-        let _ = std::fs::remove_file(&wal_path);
+        cleanup_wal_files(&wal_path);
         println!("Cycle {} complete", cycle);
     }
     
@@ -730,5 +738,5 @@ async fn chaos_l1_overflow_pressure() {
     println!("L1: {} items, {} bytes", l1_count, l1_bytes);
     
     engine.shutdown().await;
-    let _ = std::fs::remove_file(&wal_path);
+    cleanup_wal_files(&wal_path);
 }

@@ -533,6 +533,101 @@ impl SyncEngine {
         
         Ok(deleted)
     }
+    
+    // =========================================================================
+    // Prefix Scan Operations
+    // =========================================================================
+    
+    /// Scan items by ID prefix.
+    ///
+    /// Retrieves all items whose ID starts with the given prefix.
+    /// Queries SQL (ground truth) directly - does NOT check L1 cache.
+    ///
+    /// Useful for CRDT delta-first architecture where deltas are stored as:
+    /// `delta:{object_id}:{op_id}` and you need to fetch all deltas for an object.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sync_engine::{SyncEngine, StorageError};
+    /// # async fn example(engine: &SyncEngine) -> Result<(), StorageError> {
+    /// // Get base state
+    /// let base = engine.get("base:user.123").await?;
+    ///
+    /// // Get all pending deltas for this object
+    /// let deltas = engine.scan_prefix("delta:user.123:", 1000).await?;
+    ///
+    /// // Merge on-the-fly for read-repair
+    /// for delta in deltas {
+    ///     println!("Delta: {} -> {:?}", delta.object_id, delta.content_as_json());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn scan_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<SyncItem>, StorageError> {
+        if let Some(ref sql) = self.sql_store {
+            sql.scan_prefix(prefix, limit).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+    
+    /// Count items matching an ID prefix (SQL ground truth).
+    pub async fn count_prefix(&self, prefix: &str) -> Result<u64, StorageError> {
+        if let Some(ref sql) = self.sql_store {
+            sql.count_prefix(prefix).await
+        } else {
+            Ok(0)
+        }
+    }
+    
+    /// Delete all items matching an ID prefix.
+    ///
+    /// Removes from L1 cache, SQL, and Redis.
+    /// Returns the number of deleted items.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sync_engine::{SyncEngine, StorageError};
+    /// # async fn example(engine: &SyncEngine) -> Result<(), StorageError> {
+    /// // After merging deltas into base, clean them up
+    /// let deleted = engine.delete_prefix("delta:user.123:").await?;
+    /// println!("Cleaned up {} deltas", deleted);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn delete_prefix(&self, prefix: &str) -> Result<u64, StorageError> {
+        let mut deleted = 0u64;
+        
+        // Get IDs first (for L1/L2 cleanup)
+        let items = if let Some(ref sql) = self.sql_store {
+            sql.scan_prefix(prefix, 100_000).await?
+        } else {
+            Vec::new()
+        };
+        
+        // Remove from L1 cache
+        for item in &items {
+            self.l1_cache.remove(&item.object_id);
+        }
+        
+        // Remove from L2 (Redis) one-by-one via CacheStore trait
+        if let Some(ref l2) = self.l2_store {
+            for item in &items {
+                let _ = l2.delete(&item.object_id).await;
+            }
+        }
+        
+        // Delete from SQL
+        if let Some(ref sql) = self.sql_store {
+            deleted = sql.delete_prefix(prefix).await?;
+        }
+        
+        info!(prefix = %prefix, deleted = deleted, "Deleted items by prefix");
+        
+        Ok(deleted)
+    }
 }
 
 #[cfg(test)]

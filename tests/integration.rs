@@ -58,7 +58,8 @@ fn test_item(id: &str) -> SyncItem {
 }
 
 fn unique_wal_path(name: &str) -> String {
-    format!("./test_wal_{}_{}.db", name, uuid::Uuid::new_v4())
+    // Use temp/ folder to keep root clean
+    format!("./temp/test_wal_{}_{}.db", name, uuid::Uuid::new_v4())
 }
 
 /// Clean up WAL file and its associated SQLite journal files (-shm, -wal)
@@ -1368,6 +1369,144 @@ async fn happy_state_management() {
     // The state should be "overridden", not "original"
     assert_eq!(engine.count_by_state("overridden").await.unwrap(), 1);
     assert_eq!(engine.count_by_state("original").await.unwrap(), 0);
+
+    engine.shutdown().await;
+    cleanup_wal_files(&wal_path);
+}
+
+// =============================================================================
+// Prefix Scan Tests (CRDT Delta-First Pattern)
+// =============================================================================
+
+#[tokio::test]
+#[ignore] // Requires Docker (Redis + MySQL)
+async fn happy_prefix_scan() {
+    let docker = Cli::default();
+    let redis = redis_container(&docker);
+    let mysql = mysql_container(&docker);
+    
+    let redis_port = redis.get_host_port_ipv4(6379);
+    let mysql_port = mysql.get_host_port_ipv4(3306);
+    
+    // Wait for MySQL to be fully ready
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    
+    let wal_path = unique_wal_path("prefix_scan");
+    let config = SyncEngineConfig {
+        redis_url: Some(format!("redis://127.0.0.1:{}", redis_port)),
+        redis_prefix: Some("prefix_test:".to_string()),
+        sql_url: Some(format!(
+            "mysql://test:test@127.0.0.1:{}/test",
+            mysql_port
+        )),
+        wal_path: Some(wal_path.clone()),
+        ..Default::default()
+    };
+
+    let (_tx, rx) = watch::channel(config.clone());
+    let mut engine = SyncEngine::new(config, rx);
+    engine.start().await.expect("Failed to start engine");
+
+    // Simulate CRDT delta-first pattern:
+    // - delta:{object_id}:{op_id} for pending operations
+    // - base:{object_id} for merged state
+    
+    // Create deltas for user.123 (3 operations)
+    for i in 0..3 {
+        let item = SyncItem::from_json(
+            format!("delta:user.123:op{:03}", i),
+            json!({"op": "+1", "ts": i})
+        ).with_state("delta");
+        engine.submit(item).await.expect("Submit delta failed");
+    }
+    
+    // Create deltas for user.456 (2 operations)
+    for i in 0..2 {
+        let item = SyncItem::from_json(
+            format!("delta:user.456:op{:03}", i),
+            json!({"op": "-1", "ts": i})
+        ).with_state("delta");
+        engine.submit(item).await.expect("Submit delta failed");
+    }
+    
+    // Create base states
+    let base123 = SyncItem::from_json(
+        "base:user.123".into(),
+        json!({"total": 10})
+    ).with_state("base");
+    engine.submit(base123).await.expect("Submit base failed");
+    
+    let base456 = SyncItem::from_json(
+        "base:user.456".into(),
+        json!({"total": 5})
+    ).with_state("base");
+    engine.submit(base456).await.expect("Submit base failed");
+    
+    // Force flush to SQL
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    engine.force_flush().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 1. Scan specific object's deltas (the core use case)
+    let user123_deltas = engine.scan_prefix("delta:user.123:", 100)
+        .await.expect("scan_prefix failed");
+    assert_eq!(user123_deltas.len(), 3, "Should have 3 deltas for user.123");
+    for item in &user123_deltas {
+        assert!(item.object_id.starts_with("delta:user.123:"));
+        assert_eq!(item.state, "delta");
+    }
+    
+    // 2. Scan different object's deltas
+    let user456_deltas = engine.scan_prefix("delta:user.456:", 100)
+        .await.expect("scan_prefix failed");
+    assert_eq!(user456_deltas.len(), 2, "Should have 2 deltas for user.456");
+    
+    // 3. Scan all deltas (higher level prefix)
+    let all_deltas = engine.scan_prefix("delta:", 100)
+        .await.expect("scan_prefix failed");
+    assert_eq!(all_deltas.len(), 5, "Should have 5 total deltas");
+    
+    // 4. Count by prefix
+    assert_eq!(engine.count_prefix("delta:user.123:").await.unwrap(), 3);
+    assert_eq!(engine.count_prefix("delta:user.456:").await.unwrap(), 2);
+    assert_eq!(engine.count_prefix("delta:").await.unwrap(), 5);
+    assert_eq!(engine.count_prefix("base:").await.unwrap(), 2);
+    assert_eq!(engine.count_prefix("nonexistent:").await.unwrap(), 0);
+    
+    // 5. Delete by prefix (cleanup after merge)
+    // Simulate: we merged user.123's deltas, now clean them up
+    let deleted = engine.delete_prefix("delta:user.123:")
+        .await.expect("delete_prefix failed");
+    assert_eq!(deleted, 3, "Should have deleted 3 deltas");
+    
+    // Verify deletion
+    assert_eq!(engine.count_prefix("delta:user.123:").await.unwrap(), 0);
+    assert_eq!(engine.count_prefix("delta:user.456:").await.unwrap(), 2); // Other user's deltas remain
+    assert_eq!(engine.count_prefix("base:").await.unwrap(), 2); // Bases untouched
+    
+    // 6. Verify items are actually gone from L1 cache
+    let in_cache = engine.scan_prefix("delta:user.123:", 100).await.unwrap();
+    assert!(in_cache.is_empty(), "Deleted items should not be in cache");
+    
+    // 7. Scan with limit
+    // Add more deltas for limit testing
+    for i in 0..20 {
+        let item = SyncItem::from_json(
+            format!("delta:bulk:op{:03}", i),
+            json!({"op": "test"})
+        ).with_state("delta");
+        engine.submit(item).await.expect("Submit failed");
+    }
+    
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    engine.force_flush().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    
+    let limited = engine.scan_prefix("delta:bulk:", 5).await.unwrap();
+    assert_eq!(limited.len(), 5, "Should respect limit");
+    
+    let all_bulk = engine.scan_prefix("delta:bulk:", 100).await.unwrap();
+    assert_eq!(all_bulk.len(), 20, "Should get all with larger limit");
 
     engine.shutdown().await;
     cleanup_wal_files(&wal_path);

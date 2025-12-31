@@ -72,7 +72,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sync-engine = "0.1.4"
+sync-engine = "0.1.5"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
@@ -172,6 +172,28 @@ engine.delete_by_state("processed").await?;
 
 State is indexed in SQL for fast queries and tracked in Redis SETs for O(1) membership checks.
 
+## Prefix Scan
+
+Query items by ID prefix for CRDT delta-first patterns:
+
+```rust
+// Store deltas with hierarchical IDs: delta:{object_id}:{op_id}
+let op = SyncItem::from_json("delta:user.123:op001".into(), json!({"op": "+1"}))
+    .with_state("delta");
+engine.submit(op).await?;
+
+// Fetch ALL deltas for a specific object (for read-repair/merge)
+let user_deltas = engine.scan_prefix("delta:user.123:", 1000).await?;
+
+// Count pending deltas
+let pending = engine.count_prefix("delta:user.123:").await?;
+
+// After merging, cleanup the deltas
+engine.delete_prefix("delta:user.123:").await?;
+```
+
+Prefix scan queries SQL directly (ground truth) and leverages the primary key index for efficient `LIKE 'prefix%'` queries.
+
 ## Configuration
 
 | Option | Default | Description |
@@ -188,16 +210,16 @@ State is indexed in SQL for fast queries and tracked in Redis SETs for O(1) memb
 
 ## Testing
 
-Comprehensive test suite with 244 tests covering unit, property-based, integration, and chaos testing:
+Comprehensive test suite with 251 tests covering unit, property-based, integration, and chaos testing:
 
 | Test Suite | Count | Description |
 |------------|-------|-------------|
-| **Unit Tests** | 174 | Fast, no external deps |
-| **Doc Tests** | 25 | Example verification |
+| **Unit Tests** | 178 | Fast, no external deps |
+| **Doc Tests** | 27 | Example verification |
 | **Property Tests** | 12 | Proptest fuzzing for invariants |
-| **Integration Tests** | 23 | Real Redis Stack/MySQL via testcontainers |
+| **Integration Tests** | 24 | Real Redis Stack/MySQL via testcontainers |
 | **Chaos Tests** | 10 | Failure injection, container killing |
-| **Total** | **244** | ~75% code coverage |
+| **Total** | **251** | ~74% code coverage |
 
 ### Running Tests
 

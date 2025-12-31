@@ -583,4 +583,144 @@ impl RedisStore {
         
         Ok(count)
     }
+    
+    /// Scan items by ID prefix using Redis SCAN.
+    ///
+    /// Uses cursor-based SCAN with MATCH pattern for safe iteration.
+    /// Does NOT block the server (unlike KEYS).
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// // Get all deltas for object user.123
+    /// let deltas = store.scan_prefix("delta:user.123:", 1000).await?;
+    /// ```
+    pub async fn scan_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<SyncItem>, StorageError> {
+        let mut conn = self.connection.clone();
+        
+        // Build match pattern: "{store_prefix}{user_prefix}*"
+        let pattern = format!("{}{}*", self.prefix, prefix);
+        
+        let mut items = Vec::new();
+        let mut cursor: u64 = 0;
+        
+        // SCAN iteration (cursor-based, non-blocking)
+        loop {
+            // SCAN cursor MATCH pattern COUNT batch_size
+            let (new_cursor, keys): (u64, Vec<String>) = cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(100) // Batch size per iteration
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| StorageError::Backend(format!("SCAN failed: {}", e)))?;
+            
+            // Fetch each key using JSON.GET
+            for key in keys {
+                if items.len() >= limit {
+                    break;
+                }
+                
+                let json_opt: Option<String> = cmd("JSON.GET")
+                    .arg(&key)
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e| StorageError::Backend(format!("JSON.GET failed: {}", e)))?;
+                
+                if let Some(json_str) = json_opt {
+                    // Strip prefix to get clean ID
+                    let id = self.strip_prefix(&key);
+                    if let Ok(item) = Self::parse_json_document(id, &json_str) {
+                        items.push(item);
+                    }
+                }
+            }
+            
+            cursor = new_cursor;
+            
+            // Stop if cursor is 0 (complete) or we have enough items
+            if cursor == 0 || items.len() >= limit {
+                break;
+            }
+        }
+        
+        Ok(items)
+    }
+    
+    /// Count items matching an ID prefix.
+    ///
+    /// Note: This requires scanning all matching keys, so use sparingly.
+    pub async fn count_prefix(&self, prefix: &str) -> Result<u64, StorageError> {
+        let mut conn = self.connection.clone();
+        let pattern = format!("{}{}*", self.prefix, prefix);
+        
+        let mut count: u64 = 0;
+        let mut cursor: u64 = 0;
+        
+        loop {
+            let (new_cursor, keys): (u64, Vec<String>) = cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(1000)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| StorageError::Backend(format!("SCAN failed: {}", e)))?;
+            
+            count += keys.len() as u64;
+            cursor = new_cursor;
+            
+            if cursor == 0 {
+                break;
+            }
+        }
+        
+        Ok(count)
+    }
+    
+    /// Delete all items matching an ID prefix.
+    ///
+    /// Returns the number of deleted items.
+    pub async fn delete_prefix(&self, prefix: &str) -> Result<u64, StorageError> {
+        let mut conn = self.connection.clone();
+        let pattern = format!("{}{}*", self.prefix, prefix);
+        
+        let mut deleted: u64 = 0;
+        let mut cursor: u64 = 0;
+        
+        loop {
+            let (new_cursor, keys): (u64, Vec<String>) = cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(1000)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| StorageError::Backend(format!("SCAN failed: {}", e)))?;
+            
+            if !keys.is_empty() {
+                // Batch delete
+                let mut pipeline = pipe();
+                for key in &keys {
+                    pipeline.del(key);
+                }
+                pipeline.query_async::<()>(&mut conn)
+                    .await
+                    .map_err(|e| StorageError::Backend(format!("DEL failed: {}", e)))?;
+                
+                deleted += keys.len() as u64;
+            }
+            
+            cursor = new_cursor;
+            
+            if cursor == 0 {
+                break;
+            }
+        }
+        
+        Ok(deleted)
+    }
 }
