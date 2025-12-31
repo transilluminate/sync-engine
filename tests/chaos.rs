@@ -281,7 +281,7 @@ async fn chaos_redis_killed_during_batch_write() {
     let _ = tokio::time::timeout(Duration::from_secs(5), flush_handle).await;
     
     // Items should still be in L1
-    let mut eng = engine.lock().await;
+    let eng = engine.lock().await;
     let item = eng.get("batch-kill-25").await
         .expect("Get failed")
         .expect("Item should still be in L1");
@@ -525,7 +525,7 @@ async fn chaos_shutdown_without_start() {
     };
 
     let (_tx, rx) = watch::channel(config.clone());
-    let mut engine = SyncEngine::new(config, rx);
+    let engine = SyncEngine::new(config, rx);
     
     assert_eq!(engine.state(), EngineState::Created);
     

@@ -430,7 +430,7 @@ async fn failure_concurrent_writes_during_redis_outage() {
     }
     
     // Engine should still be operational
-    let mut eng = engine.lock().await;
+    let eng = engine.lock().await;
     assert!(eng.is_ready(), "Engine should remain ready after Redis death");
     
     // Shutdown with timeout (may hang trying to flush to dead Redis)

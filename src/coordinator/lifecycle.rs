@@ -475,7 +475,7 @@ impl SyncEngine {
 
     /// Initiate graceful shutdown
     #[tracing::instrument(skip(self))]
-    pub async fn shutdown(&mut self) {
+    pub async fn shutdown(&self) {
         use crate::FlushReason;
         
         let shutdown_start = std::time::Instant::now();
