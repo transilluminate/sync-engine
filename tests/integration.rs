@@ -61,6 +61,13 @@ fn unique_wal_path(name: &str) -> String {
     format!("./test_wal_{}_{}.db", name, uuid::Uuid::new_v4())
 }
 
+/// Clean up WAL file and its associated SQLite journal files (-shm, -wal)
+fn cleanup_wal_files(wal_path: &str) {
+    let _ = std::fs::remove_file(wal_path);
+    let _ = std::fs::remove_file(format!("{}-shm", wal_path));
+    let _ = std::fs::remove_file(format!("{}-wal", wal_path));
+}
+
 // =============================================================================
 // Happy Path Tests - Normal Operation
 // =============================================================================
@@ -1234,4 +1241,134 @@ async fn coverage_merkle_with_prefix() {
         .collect();
     
     assert!(truly_unprefixed.is_empty(), "Should have no unprefixed merkle keys: {:?}", truly_unprefixed);
+}
+
+// =============================================================================
+// State Management Tests
+// =============================================================================
+
+#[tokio::test]
+#[ignore] // Requires Docker (Redis + MySQL)
+async fn happy_state_management() {
+    let docker = Cli::default();
+    let redis = redis_container(&docker);
+    let mysql = mysql_container(&docker);
+    
+    let redis_port = redis.get_host_port_ipv4(6379);
+    let mysql_port = mysql.get_host_port_ipv4(3306);
+    
+    // Wait for MySQL to be fully ready
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    
+    let wal_path = unique_wal_path("state_mgmt");
+    let config = SyncEngineConfig {
+        redis_url: Some(format!("redis://127.0.0.1:{}", redis_port)),
+        redis_prefix: Some("state_test:".to_string()),
+        sql_url: Some(format!(
+            "mysql://test:test@127.0.0.1:{}/test",
+            mysql_port
+        )),
+        wal_path: Some(wal_path.clone()),
+        ..Default::default()
+    };
+
+    let (_tx, rx) = watch::channel(config.clone());
+    let mut engine = SyncEngine::new(config, rx);
+    engine.start().await.expect("Failed to start engine");
+
+    // 1. Submit items with different states
+    use sync_engine::SubmitOptions;
+    
+    // Delta items (CRDT deltas waiting to be merged)
+    for i in 0..5 {
+        let item = SyncItem::from_json(
+            format!("crdt.delta.{}", i),
+            json!({"operation": "add", "value": i})
+        ).with_state("delta");
+        engine.submit(item).await.expect("Submit delta failed");
+    }
+    
+    // Base items (merged CRDT state)
+    for i in 0..3 {
+        let item = SyncItem::from_json(
+            format!("crdt.base.{}", i),
+            json!({"total": i * 10})
+        ).with_state("base");
+        engine.submit(item).await.expect("Submit base failed");
+    }
+    
+    // Default state items
+    for i in 0..2 {
+        let item = SyncItem::from_json(
+            format!("regular.{}", i),
+            json!({"data": "normal"})
+        );
+        engine.submit(item).await.expect("Submit regular failed");
+    }
+    
+    // Force flush to ensure items hit SQL (timing-based waits are unreliable under coverage)
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    engine.force_flush().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 2. Query by state
+    let deltas = engine.get_by_state("delta", 100).await.expect("get_by_state failed");
+    assert_eq!(deltas.len(), 5, "Should have 5 delta items");
+    for item in &deltas {
+        assert_eq!(item.state, "delta");
+        assert!(item.object_id.starts_with("crdt.delta."));
+    }
+    
+    let bases = engine.get_by_state("base", 100).await.expect("get_by_state failed");
+    assert_eq!(bases.len(), 3, "Should have 3 base items");
+    
+    let defaults = engine.get_by_state("default", 100).await.expect("get_by_state failed");
+    assert_eq!(defaults.len(), 2, "Should have 2 default items");
+
+    // 3. Count by state
+    assert_eq!(engine.count_by_state("delta").await.unwrap(), 5);
+    assert_eq!(engine.count_by_state("base").await.unwrap(), 3);
+    assert_eq!(engine.count_by_state("default").await.unwrap(), 2);
+    assert_eq!(engine.count_by_state("nonexistent").await.unwrap(), 0);
+
+    // 4. List state IDs (lightweight query)
+    let delta_ids = engine.list_state_ids("delta", 100).await.expect("list_state_ids failed");
+    assert_eq!(delta_ids.len(), 5);
+    assert!(delta_ids.iter().all(|id| id.starts_with("crdt.delta.")));
+
+    // 5. Update state (simulate merging deltas to base)
+    let updated = engine.set_state("crdt.delta.0", "merged").await.expect("set_state failed");
+    assert!(updated, "Should have updated the item");
+    
+    // Verify the state change
+    assert_eq!(engine.count_by_state("delta").await.unwrap(), 4);
+    assert_eq!(engine.count_by_state("merged").await.unwrap(), 1);
+
+    // 6. Delete by state (cleanup merged items)
+    let deleted = engine.delete_by_state("merged").await.expect("delete_by_state failed");
+    assert_eq!(deleted, 1, "Should have deleted 1 merged item");
+    
+    assert_eq!(engine.count_by_state("merged").await.unwrap(), 0);
+    
+    // Note: The item may still be in L1 cache briefly, but SQL is the ground truth.
+    // count_by_state returning 0 confirms deletion from SQL.
+
+    // 7. Submit with state override via SubmitOptions
+    let item = SyncItem::from_json("override.test".into(), json!({"test": true}))
+        .with_state("original");
+    
+    engine.submit_with(item, SubmitOptions::default().with_state("overridden"))
+        .await.expect("submit_with failed");
+    
+    // Force flush and wait
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    engine.force_flush().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    
+    // The state should be "overridden", not "original"
+    assert_eq!(engine.count_by_state("overridden").await.unwrap(), 1);
+    assert_eq!(engine.count_by_state("original").await.unwrap(), 0);
+
+    engine.shutdown().await;
+    cleanup_wal_files(&wal_path);
 }

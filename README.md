@@ -19,35 +19,35 @@ optimizes storage for queryability while maintaining the original data integrity
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        Ingest Layer                         │
-│  • Accepts SyncItems via submit() / submit_with()          │
-│  • Backpressure control based on memory usage              │
+│  • Accepts SyncItems via submit() / submit_with()           │
+│  • Backpressure control based on memory usage               │
 └─────────────────────────────────────────────────────────────┘
                              │
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                    L1: In-Memory Cache                      │
-│  • Moka cache for concurrent access                        │
-│  • Tan-curve eviction under memory pressure                │
+│  • Moka cache for concurrent access                         │
+│  • Tan-curve eviction under memory pressure                 │
 └─────────────────────────────────────────────────────────────┘
                              │
                    (Batch flush via HybridBatcher)
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                     L2: Redis Cache                         │
-│  • RedisJSON for structured data (JSON.SET/JSON.GET)       │
-│  • RediSearch for full-text & field queries                │
-│  • Binary fallback for non-JSON content                    │
-│  • Optional per-item TTL                                   │
+│  • RedisJSON for structured data (JSON.SET/JSON.GET)        │
+│  • RediSearch for full-text & field queries                 │
+│  • Binary fallback for non-JSON content                     │
+│  • Optional per-item TTL                                    │
 └─────────────────────────────────────────────────────────────┘
                              │
                    (Batch persist to ground truth)
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                   L3: MySQL/SQLite Archive                  │
-│  • JSON in TEXT column (queryable via JSON_EXTRACT)        │
-│  • Binary in BLOB column                                   │
-│  • Cuckoo filter for fast existence checks                 │
-│  • WAL fallback during outages                             │
+│  • JSON in TEXT column (queryable via JSON_EXTRACT)         │
+│  • Binary in BLOB column                                    │
+│  • Cuckoo filter for fast existence checks                  │
+│  • WAL fallback during outages                              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -58,6 +58,7 @@ optimizes storage for queryability while maintaining the original data integrity
 - **RedisJSON + RediSearch**: Full-text and field-based queries on Redis data
 - **MySQL JSON Queries**: JSON_EXTRACT on payload column for SQL searches
 - **Flexible Routing**: `SubmitOptions` controls which tiers receive data
+- **Item State**: Tag items with caller-defined state for grouping and batch ops
 - **TTL Support**: Per-item TTL for Redis cache entries
 - **Batch Writes**: Configurable flush by count, size, or time
 - **Cuckoo Filters**: Skip SQL queries when data definitely doesn't exist
@@ -71,7 +72,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sync-engine = "0.1"
+sync-engine = "0.1.4"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
@@ -143,6 +144,34 @@ let custom = SubmitOptions {
 };
 ```
 
+## Item State
+
+Tag items with caller-defined state for grouping and batch operations:
+
+```rust
+use sync_engine::{SyncItem, SubmitOptions};
+use serde_json::json;
+
+// Create item with state (e.g., CRDT deltas vs base state)
+let delta = SyncItem::from_json("crdt.user.123".into(), json!({"op": "add"}))
+    .with_state("delta");
+
+// Override state via SubmitOptions
+engine.submit_with(item, SubmitOptions::default().with_state("pending")).await?;
+
+// Query by state
+let deltas = engine.get_by_state("delta", 1000).await?;
+let count = engine.count_by_state("pending").await?;
+
+// Update state (e.g., after processing)
+engine.set_state("crdt.user.123", "merged").await?;
+
+// Bulk delete by state
+engine.delete_by_state("processed").await?;
+```
+
+State is indexed in SQL for fast queries and tracked in Redis SETs for O(1) membership checks.
+
 ## Configuration
 
 | Option | Default | Description |
@@ -159,16 +188,16 @@ let custom = SubmitOptions {
 
 ## Testing
 
-Comprehensive test suite with 218 tests covering unit, property-based, integration, and chaos testing:
+Comprehensive test suite with 244 tests covering unit, property-based, integration, and chaos testing:
 
 | Test Suite | Count | Description |
 |------------|-------|-------------|
-| **Unit Tests** | 155 | Fast, no external deps |
-| **Doc Tests** | 20 | Example verification |
+| **Unit Tests** | 174 | Fast, no external deps |
+| **Doc Tests** | 25 | Example verification |
 | **Property Tests** | 12 | Proptest fuzzing for invariants |
-| **Integration Tests** | 22 | Real Redis Stack/MySQL via testcontainers |
+| **Integration Tests** | 23 | Real Redis Stack/MySQL via testcontainers |
 | **Chaos Tests** | 10 | Failure injection, container killing |
-| **Total** | **219** | ~74% code coverage |
+| **Total** | **244** | ~75% code coverage |
 
 ### Running Tests
 

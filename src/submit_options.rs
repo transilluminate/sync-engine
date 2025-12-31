@@ -135,6 +135,14 @@ pub struct SubmitOptions {
     ///
     /// Default: `true`
     pub sql: bool,
+    
+    /// Override state tag for this item.
+    ///
+    /// If `Some`, overrides the item's existing state.
+    /// If `None`, uses the item's current state (default: "default").
+    ///
+    /// State is indexed for fast queries: SQL index + Redis SETs.
+    pub state: Option<String>,
 }
 
 impl Default for SubmitOptions {
@@ -143,6 +151,7 @@ impl Default for SubmitOptions {
             redis: true,
             redis_ttl: None,
             sql: true,
+            state: None,
         }
     }
 }
@@ -173,6 +182,7 @@ impl SubmitOptions {
             redis: true,
             redis_ttl: Some(ttl),
             sql: false,
+            state: None,
         }
     }
 
@@ -186,7 +196,23 @@ impl SubmitOptions {
             redis: false,
             redis_ttl: None,
             sql: true,
+            state: None,
         }
+    }
+    
+    /// Set the state for items submitted with these options (builder pattern).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sync_engine::SubmitOptions;
+    ///
+    /// let opts = SubmitOptions::default().with_state("delta");
+    /// ```
+    #[must_use]
+    pub fn with_state(mut self, state: impl Into<String>) -> Self {
+        self.state = Some(state.into());
+        self
     }
 
     /// Returns true if data should be stored anywhere.
@@ -235,6 +261,7 @@ impl OptionsKey {
             redis: self.redis,
             redis_ttl: self.redis_ttl,
             sql: self.sql,
+            state: None,
         }
     }
 }
@@ -359,5 +386,41 @@ mod tests {
         map.entry(key).or_default().push("item1".into());
         
         assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn test_state_default_none() {
+        let opts = SubmitOptions::default();
+        assert!(opts.state.is_none());
+    }
+
+    #[test]
+    fn test_state_with_state_builder() {
+        let opts = SubmitOptions::default().with_state("delta");
+        assert_eq!(opts.state, Some("delta".to_string()));
+    }
+
+    #[test]
+    fn test_state_cache_with_state() {
+        let opts = SubmitOptions::cache(CacheTtl::Hour).with_state("pending");
+        assert!(opts.redis);
+        assert!(!opts.sql);
+        assert_eq!(opts.state, Some("pending".to_string()));
+    }
+
+    #[test]
+    fn test_state_durable_with_state() {
+        let opts = SubmitOptions::durable().with_state("archived");
+        assert!(!opts.redis);
+        assert!(opts.sql);
+        assert_eq!(opts.state, Some("archived".to_string()));
+    }
+
+    #[test]
+    fn test_state_to_options_preserves_none() {
+        let opts = SubmitOptions::cache(CacheTtl::Hour);
+        let key = OptionsKey::from(&opts);
+        let recovered = key.to_options();
+        assert!(recovered.state.is_none());
     }
 }

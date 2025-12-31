@@ -143,6 +143,11 @@ pub struct SyncItem {
     pub content: Vec<u8>,
     /// Optional guest data owner ID (for routing engine)
     pub home_instance_id: Option<String>,
+    /// Arbitrary state tag for caller-defined grouping (e.g., "delta", "base", "pending").
+    /// Indexed in SQL and tracked via Redis SETs for fast state-based queries.
+    /// Default: "default"
+    #[serde(default = "default_state")]
+    pub state: String,
     
     /// Transient submit options (travels with item through pipeline, not serialized)
     /// Set via `submit_with()`, defaults to `SubmitOptions::default()` if None.
@@ -152,6 +157,11 @@ pub struct SyncItem {
     /// Cached computed size in bytes (lazily computed, not serialized)
     #[serde(skip)]
     cached_size: OnceLock<usize>,
+}
+
+/// Default state value for SyncItem
+fn default_state() -> String {
+    "default".to_string()
 }
 
 impl SyncItem {
@@ -194,6 +204,7 @@ impl SyncItem {
             access_count: 0,
             content,
             home_instance_id: None,
+            state: "default".to_string(),
             submit_options: None,  // Set via submit_with() if needed
             cached_size: OnceLock::new(),
         }
@@ -226,6 +237,7 @@ impl SyncItem {
         trace_parent: Option<String>,
         merkle_root: String,
         home_instance_id: Option<String>,
+        state: String,
     ) -> Self {
         Self {
             object_id,
@@ -241,6 +253,7 @@ impl SyncItem {
             access_count: 0,
             content,
             home_instance_id,
+            state,
             submit_options: None,
             cached_size: OnceLock::new(),
         }
@@ -263,6 +276,25 @@ impl SyncItem {
     #[must_use]
     pub fn with_options(mut self, options: SubmitOptions) -> Self {
         self.submit_options = Some(options);
+        self
+    }
+    
+    /// Set state tag for this item (builder pattern).
+    ///
+    /// State is an arbitrary string for caller-defined grouping.
+    /// Common uses: "delta"/"base" for CRDTs, "pending"/"approved" for workflows.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sync_engine::SyncItem;
+    ///
+    /// let item = SyncItem::new("crdt.123".into(), b"data".to_vec())
+    ///     .with_state("delta");
+    /// ```
+    #[must_use]
+    pub fn with_state(mut self, state: impl Into<String>) -> Self {
+        self.state = state.into();
         self
     }
 
@@ -493,5 +525,58 @@ mod tests {
         
         // Should be substantial (10000 * 4 bytes = 40000)
         assert!(size > 10000, "Large content should result in large size");
+    }
+
+    #[test]
+    fn test_state_default() {
+        let item = SyncItem::new("test".to_string(), b"data".to_vec());
+        assert_eq!(item.state, "default");
+    }
+
+    #[test]
+    fn test_state_with_state_builder() {
+        let item = SyncItem::new("test".to_string(), b"data".to_vec())
+            .with_state("delta");
+        assert_eq!(item.state, "delta");
+    }
+
+    #[test]
+    fn test_state_with_state_chaining() {
+        let item = SyncItem::from_json("test".into(), json!({"key": "value"}))
+            .with_state("pending");
+        
+        assert_eq!(item.state, "pending");
+        assert_eq!(item.object_id, "test");
+    }
+
+    #[test]
+    fn test_state_serialization() {
+        let item = SyncItem::new("test".to_string(), b"data".to_vec())
+            .with_state("custom_state");
+        
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(json.contains("\"state\":\"custom_state\""));
+        
+        // Deserialize back
+        let parsed: SyncItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.state, "custom_state");
+    }
+
+    #[test]
+    fn test_state_deserialization_default() {
+        // JSON without state field should default to "default"
+        let json = r#"{
+            "object_id": "test",
+            "version": 1,
+            "updated_at": 12345,
+            "priority_score": 0.0,
+            "merkle_root": "",
+            "last_accessed": 0,
+            "access_count": 0,
+            "content": [100, 97, 116, 97]
+        }"#;
+        
+        let item: SyncItem = serde_json::from_str(json).unwrap();
+        assert_eq!(item.state, "default");
     }
 }

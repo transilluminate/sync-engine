@@ -74,6 +74,12 @@ impl SqlStore {
         .await?;
 
         let store = Self { pool, is_sqlite };
+        
+        // Enable WAL mode for SQLite (better concurrency, faster writes)
+        if is_sqlite {
+            store.enable_wal_mode().await?;
+        }
+        
         store.init_schema().await?;
         Ok(store)
     }
@@ -81,6 +87,28 @@ impl SqlStore {
     /// Get a clone of the connection pool for sharing with other stores.
     pub fn pool(&self) -> AnyPool {
         self.pool.clone()
+    }
+    
+    /// Enable WAL (Write-Ahead Logging) mode for SQLite.
+    /// 
+    /// Benefits:
+    /// - Concurrent reads during writes (readers don't block writers)
+    /// - Better write performance (single fsync instead of two)
+    /// - More predictable performance under load
+    async fn enable_wal_mode(&self) -> Result<(), StorageError> {
+        sqlx::query("PRAGMA journal_mode = WAL")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::Backend(format!("Failed to enable WAL mode: {}", e)))?;
+        
+        // Also set synchronous to NORMAL for better performance while still safe
+        // (FULL is default but WAL mode is safe with NORMAL)
+        sqlx::query("PRAGMA synchronous = NORMAL")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::Backend(format!("Failed to set synchronous mode: {}", e)))?;
+        
+        Ok(())
     }
 
     async fn init_schema(&self) -> Result<(), StorageError> {
@@ -90,6 +118,9 @@ impl SqlStore {
         //
         // merkle_dirty: Set to 1 on write, background task sets to 0 after merkle recalc.
         // This enables efficient multi-instance coordination without locking.
+        //
+        // state: Arbitrary caller-defined state tag (e.g., "delta", "base", "pending").
+        // Indexed for fast state-based queries.
         let sql = if self.is_sqlite {
             r#"
             CREATE TABLE IF NOT EXISTS sync_items (
@@ -100,7 +131,8 @@ impl SqlStore {
                 payload TEXT,
                 payload_blob BLOB,
                 audit TEXT,
-                merkle_dirty INTEGER NOT NULL DEFAULT 1
+                merkle_dirty INTEGER NOT NULL DEFAULT 1,
+                state TEXT NOT NULL DEFAULT 'default'
             )
             "#
         } else {
@@ -116,8 +148,10 @@ impl SqlStore {
                 payload_blob MEDIUMBLOB,
                 audit TEXT,
                 merkle_dirty TINYINT NOT NULL DEFAULT 1,
+                state VARCHAR(32) NOT NULL DEFAULT 'default',
                 INDEX idx_timestamp (timestamp),
-                INDEX idx_merkle_dirty (merkle_dirty)
+                INDEX idx_merkle_dirty (merkle_dirty),
+                INDEX idx_state (state)
             )
             "#
         };
@@ -179,7 +213,7 @@ impl ArchiveStore for SqlStore {
         
         retry("sql_get", &RetryConfig::query(), || async {
             let result = sqlx::query(
-                "SELECT version, timestamp, payload_hash, payload, payload_blob, audit FROM sync_items WHERE id = ?"
+                "SELECT version, timestamp, payload_hash, payload, payload_blob, audit, state FROM sync_items WHERE id = ?"
             )
                 .bind(&id)
                 .fetch_optional(&self.pool)
@@ -192,18 +226,29 @@ impl ArchiveStore for SqlStore {
                     let timestamp: i64 = row.try_get("timestamp").unwrap_or(0);
                     let payload_hash: Option<String> = row.try_get("payload_hash").ok();
                     
-                    // sqlx Any driver treats MySQL LONGTEXT as BLOB, so we read as bytes
-                    // and convert to String for JSON payload
-                    let payload_bytes: Option<Vec<u8>> = row.try_get("payload").ok();
-                    let payload_json: Option<String> = payload_bytes.and_then(|bytes| {
-                        String::from_utf8(bytes).ok()
-                    });
+                    // Try reading payload as String first (SQLite TEXT), then as bytes (MySQL LONGTEXT)
+                    let payload_json: Option<String> = row.try_get::<String, _>("payload").ok()
+                        .or_else(|| {
+                            row.try_get::<Vec<u8>, _>("payload").ok()
+                                .and_then(|bytes| String::from_utf8(bytes).ok())
+                        });
                     
                     let payload_blob: Option<Vec<u8>> = row.try_get("payload_blob").ok();
-                    let audit_bytes: Option<Vec<u8>> = row.try_get("audit").ok();
-                    let audit_json: Option<String> = audit_bytes.and_then(|bytes| {
-                        String::from_utf8(bytes).ok()
-                    });
+                    
+                    // Try reading audit as String first (SQLite TEXT), then as bytes (MySQL LONGTEXT)
+                    let audit_json: Option<String> = row.try_get::<String, _>("audit").ok()
+                        .or_else(|| {
+                            row.try_get::<Vec<u8>, _>("audit").ok()
+                                .and_then(|bytes| String::from_utf8(bytes).ok())
+                        });
+                    
+                    // State field - try String first (SQLite), then bytes (MySQL)
+                    let state: String = row.try_get::<String, _>("state").ok()
+                        .or_else(|| {
+                            row.try_get::<Vec<u8>, _>("state").ok()
+                                .and_then(|bytes| String::from_utf8(bytes).ok())
+                        })
+                        .unwrap_or_else(|| "default".to_string());
                     
                     // Determine content and content_type
                     let (content, content_type) = if let Some(ref json_str) = payload_json {
@@ -230,6 +275,7 @@ impl ArchiveStore for SqlStore {
                         trace_parent,
                         payload_hash.unwrap_or_default(),
                         home_instance_id,
+                        state,
                     );
                     Ok(Some(item))
                 }
@@ -245,6 +291,7 @@ impl ArchiveStore for SqlStore {
         let timestamp = item.updated_at;
         let payload_hash = if item.merkle_root.is_empty() { None } else { Some(item.merkle_root.clone()) };
         let audit_json = Self::build_audit_json(item);
+        let state = item.state.clone();
         
         // Determine payload storage based on content type
         let (payload_json, payload_blob): (Option<String>, Option<Vec<u8>>) = match item.content_type {
@@ -258,8 +305,8 @@ impl ArchiveStore for SqlStore {
         };
 
         let sql = if self.is_sqlite {
-            "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1) 
+            "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty, state) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?) 
              ON CONFLICT(id) DO UPDATE SET 
                 version = excluded.version, 
                 timestamp = excluded.timestamp, 
@@ -267,10 +314,11 @@ impl ArchiveStore for SqlStore {
                 payload = excluded.payload, 
                 payload_blob = excluded.payload_blob, 
                 audit = excluded.audit, 
-                merkle_dirty = 1"
+                merkle_dirty = 1, 
+                state = excluded.state"
         } else {
-            "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1) 
+            "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty, state) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?) 
              ON DUPLICATE KEY UPDATE 
                 version = VALUES(version), 
                 timestamp = VALUES(timestamp), 
@@ -278,7 +326,8 @@ impl ArchiveStore for SqlStore {
                 payload = VALUES(payload), 
                 payload_blob = VALUES(payload_blob), 
                 audit = VALUES(audit), 
-                merkle_dirty = 1"
+                merkle_dirty = 1, 
+                state = VALUES(state)"
         };
 
         retry("sql_put", &RetryConfig::query(), || async {
@@ -290,6 +339,7 @@ impl ArchiveStore for SqlStore {
                 .bind(&payload_json)
                 .bind(&payload_blob)
                 .bind(&audit_json)
+                .bind(&state)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| StorageError::Backend(e.to_string()))?;
@@ -407,12 +457,12 @@ impl SqlStore {
     /// The batch_id is already embedded in each item's audit JSON.
     async fn put_batch_chunk(&self, chunk: &[SyncItem], _batch_id: &str) -> Result<usize, StorageError> {
         let placeholders: Vec<String> = (0..chunk.len())
-            .map(|_| "(?, ?, ?, ?, ?, ?, ?, 1)".to_string())
+            .map(|_| "(?, ?, ?, ?, ?, ?, ?, 1, ?)".to_string())
             .collect();
         
         let sql = if self.is_sqlite {
             format!(
-                "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty) VALUES {} \
+                "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty, state) VALUES {} \
                  ON CONFLICT(id) DO UPDATE SET \
                     version = excluded.version, \
                     timestamp = excluded.timestamp, \
@@ -420,12 +470,13 @@ impl SqlStore {
                     payload = excluded.payload, \
                     payload_blob = excluded.payload_blob, \
                     audit = excluded.audit, \
-                    merkle_dirty = 1",
+                    merkle_dirty = 1, \
+                    state = excluded.state",
                 placeholders.join(", ")
             )
         } else {
             format!(
-                "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty) VALUES {} \
+                "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty, state) VALUES {} \
                  ON DUPLICATE KEY UPDATE \
                     version = VALUES(version), \
                     timestamp = VALUES(timestamp), \
@@ -433,7 +484,8 @@ impl SqlStore {
                     payload = VALUES(payload), \
                     payload_blob = VALUES(payload_blob), \
                     audit = VALUES(audit), \
-                    merkle_dirty = 1",
+                    merkle_dirty = 1, \
+                    state = VALUES(state)",
                 placeholders.join(", ")
             )
         };
@@ -448,6 +500,7 @@ impl SqlStore {
             payload_json: Option<String>,
             payload_blob: Option<Vec<u8>>,
             audit_json: Option<String>,
+            state: String,
         }
         
         let prepared: Vec<PreparedRow> = chunk.iter()
@@ -470,6 +523,7 @@ impl SqlStore {
                     payload_json,
                     payload_blob,
                     audit_json: Self::build_audit_json(item),
+                    state: item.state.clone(),
                 }
             })
             .collect();
@@ -488,7 +542,8 @@ impl SqlStore {
                         .bind(&row.payload_hash)
                         .bind(&row.payload_json)
                         .bind(&row.payload_blob)
-                        .bind(&row.audit_json);
+                        .bind(&row.audit_json)
+                        .bind(&row.state);
                 }
                 
                 query.execute(&self.pool)
@@ -535,7 +590,7 @@ impl SqlStore {
     /// Scan a batch of items (for WAL drain).
     pub async fn scan_batch(&self, limit: usize) -> Result<Vec<SyncItem>, StorageError> {
         let rows = sqlx::query(
-            "SELECT id, version, timestamp, payload_hash, payload, payload_blob, audit FROM sync_items ORDER BY timestamp ASC LIMIT ?"
+            "SELECT id, version, timestamp, payload_hash, payload, payload_blob, audit, state FROM sync_items ORDER BY timestamp ASC LIMIT ?"
         )
             .bind(limit as i64)
             .fetch_all(&self.pool)
@@ -557,6 +612,11 @@ impl SqlStore {
             let audit_bytes: Option<Vec<u8>> = row.try_get("audit").ok();
             let audit_json: Option<String> = audit_bytes.and_then(|b| String::from_utf8(b).ok());
             
+            let state_bytes: Option<Vec<u8>> = row.try_get("state").ok();
+            let state: String = state_bytes
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .unwrap_or_else(|| "default".to_string());
+            
             let (content, content_type) = if let Some(ref json_str) = payload_json {
                 (json_str.as_bytes().to_vec(), ContentType::Json)
             } else if let Some(blob) = payload_blob {
@@ -577,6 +637,7 @@ impl SqlStore {
                 trace_parent,
                 payload_hash.unwrap_or_default(),
                 home_instance_id,
+                state,
             );
             items.push(item);
         }
@@ -694,7 +755,7 @@ impl SqlStore {
     /// Use `mark_merkle_clean()` after processing to clear the flag.
     pub async fn get_dirty_merkle_items(&self, limit: usize) -> Result<Vec<SyncItem>, StorageError> {
         let rows = sqlx::query(
-            "SELECT id, version, timestamp, payload_hash, payload, payload_blob, audit 
+            "SELECT id, version, timestamp, payload_hash, payload, payload_blob, audit, state 
              FROM sync_items WHERE merkle_dirty = 1 LIMIT ?"
         )
             .bind(limit as i64)
@@ -722,6 +783,12 @@ impl SqlStore {
                 String::from_utf8(bytes).ok()
             });
             
+            // State field
+            let state_bytes: Option<Vec<u8>> = row.try_get("state").ok();
+            let state: String = state_bytes
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .unwrap_or_else(|| "default".to_string());
+            
             // Determine content and content_type
             let (content, content_type) = if let Some(ref json_str) = payload_json {
                 (json_str.as_bytes().to_vec(), ContentType::Json)
@@ -744,10 +811,373 @@ impl SqlStore {
                 trace_parent,
                 payload_hash.unwrap_or_default(),
                 home_instance_id,
+                state,
             );
             items.push(item);
         }
         
         Ok(items)
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // State-based queries: Fast indexed access by caller-defined state tag
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Get items by state (e.g., "delta", "base", "pending").
+    ///
+    /// Uses indexed query for fast retrieval.
+    pub async fn get_by_state(&self, state: &str, limit: usize) -> Result<Vec<SyncItem>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT id, version, timestamp, payload_hash, payload, payload_blob, audit, state 
+             FROM sync_items WHERE state = ? LIMIT ?"
+        )
+            .bind(state)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Backend(format!("Failed to get items by state: {}", e)))?;
+        
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get("id")
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            let version: i64 = row.try_get("version").unwrap_or(1);
+            let timestamp: i64 = row.try_get("timestamp").unwrap_or(0);
+            let payload_hash: Option<String> = row.try_get("payload_hash").ok();
+            
+            // Try reading payload as String first (SQLite TEXT), then as bytes (MySQL LONGTEXT)
+            let payload_json: Option<String> = row.try_get::<String, _>("payload").ok()
+                .or_else(|| {
+                    row.try_get::<Vec<u8>, _>("payload").ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                });
+            
+            let payload_blob: Option<Vec<u8>> = row.try_get("payload_blob").ok();
+            
+            // Try reading audit as String first (SQLite), then bytes (MySQL)
+            let audit_json: Option<String> = row.try_get::<String, _>("audit").ok()
+                .or_else(|| {
+                    row.try_get::<Vec<u8>, _>("audit").ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                });
+            
+            // State field - try String first (SQLite), then bytes (MySQL)
+            let state: String = row.try_get::<String, _>("state").ok()
+                .or_else(|| {
+                    row.try_get::<Vec<u8>, _>("state").ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                })
+                .unwrap_or_else(|| "default".to_string());
+            
+            let (content, content_type) = if let Some(ref json_str) = payload_json {
+                (json_str.as_bytes().to_vec(), ContentType::Json)
+            } else if let Some(blob) = payload_blob {
+                (blob, ContentType::Binary)
+            } else {
+                continue;
+            };
+            
+            let (batch_id, trace_parent, home_instance_id) = Self::parse_audit_json(audit_json);
+            
+            let item = SyncItem::reconstruct(
+                id,
+                version as u64,
+                timestamp,
+                content_type,
+                content,
+                batch_id,
+                trace_parent,
+                payload_hash.unwrap_or_default(),
+                home_instance_id,
+                state,
+            );
+            items.push(item);
+        }
+        
+        Ok(items)
+    }
+    
+    /// Count items in a given state.
+    pub async fn count_by_state(&self, state: &str) -> Result<u64, StorageError> {
+        let result = sqlx::query("SELECT COUNT(*) as cnt FROM sync_items WHERE state = ?")
+            .bind(state)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        
+        let count: i64 = result.try_get("cnt")
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        
+        Ok(count as u64)
+    }
+    
+    /// Get just the IDs of items in a given state (lightweight query).
+    pub async fn list_state_ids(&self, state: &str, limit: usize) -> Result<Vec<String>, StorageError> {
+        let rows = sqlx::query("SELECT id FROM sync_items WHERE state = ? LIMIT ?")
+            .bind(state)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Backend(format!("Failed to list state IDs: {}", e)))?;
+        
+        let mut ids = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get("id")
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            ids.push(id);
+        }
+        
+        Ok(ids)
+    }
+    
+    /// Update the state of an item by ID.
+    pub async fn set_state(&self, id: &str, new_state: &str) -> Result<bool, StorageError> {
+        let result = sqlx::query("UPDATE sync_items SET state = ? WHERE id = ?")
+            .bind(new_state)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        
+        Ok(result.rows_affected() > 0)
+    }
+    
+    /// Delete all items in a given state.
+    ///
+    /// Returns the number of deleted items.
+    pub async fn delete_by_state(&self, state: &str) -> Result<u64, StorageError> {
+        let result = sqlx::query("DELETE FROM sync_items WHERE state = ?")
+            .bind(state)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        
+        Ok(result.rows_affected())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use serde_json::json;
+    
+    fn temp_db_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("sql_state_test_{}.db", name))
+    }
+    
+    fn test_item(id: &str, state: &str) -> SyncItem {
+        SyncItem::from_json(id.to_string(), json!({"id": id}))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn test_state_stored_and_retrieved() {
+        let db_path = temp_db_path("stored");
+        let _ = std::fs::remove_file(&db_path);
+        
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let store = SqlStore::new(&url).await.unwrap();
+        
+        // Store item with custom state
+        let item = test_item("item1", "delta");
+        store.put(&item).await.unwrap();
+        
+        // Retrieve and verify state
+        let retrieved = store.get("item1").await.unwrap().unwrap();
+        assert_eq!(retrieved.state, "delta");
+        
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn test_state_default_value() {
+        let db_path = temp_db_path("default");
+        let _ = std::fs::remove_file(&db_path);
+        
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let store = SqlStore::new(&url).await.unwrap();
+        
+        // Store item with default state
+        let item = SyncItem::from_json("item1".into(), json!({"test": true}));
+        store.put(&item).await.unwrap();
+        
+        let retrieved = store.get("item1").await.unwrap().unwrap();
+        assert_eq!(retrieved.state, "default");
+        
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn test_get_by_state() {
+        let db_path = temp_db_path("get_by_state");
+        let _ = std::fs::remove_file(&db_path);
+        
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let store = SqlStore::new(&url).await.unwrap();
+        
+        // Insert items in different states
+        store.put(&test_item("delta1", "delta")).await.unwrap();
+        store.put(&test_item("delta2", "delta")).await.unwrap();
+        store.put(&test_item("base1", "base")).await.unwrap();
+        store.put(&test_item("pending1", "pending")).await.unwrap();
+        
+        // Query by state
+        let deltas = store.get_by_state("delta", 100).await.unwrap();
+        assert_eq!(deltas.len(), 2);
+        assert!(deltas.iter().all(|i| i.state == "delta"));
+        
+        let bases = store.get_by_state("base", 100).await.unwrap();
+        assert_eq!(bases.len(), 1);
+        assert_eq!(bases[0].object_id, "base1");
+        
+        // Empty result for non-existent state
+        let none = store.get_by_state("nonexistent", 100).await.unwrap();
+        assert!(none.is_empty());
+        
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn test_get_by_state_with_limit() {
+        let db_path = temp_db_path("get_by_state_limit");
+        let _ = std::fs::remove_file(&db_path);
+        
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let store = SqlStore::new(&url).await.unwrap();
+        
+        // Insert 10 items
+        for i in 0..10 {
+            store.put(&test_item(&format!("item{}", i), "batch")).await.unwrap();
+        }
+        
+        // Query with limit
+        let limited = store.get_by_state("batch", 5).await.unwrap();
+        assert_eq!(limited.len(), 5);
+        
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn test_count_by_state() {
+        let db_path = temp_db_path("count_by_state");
+        let _ = std::fs::remove_file(&db_path);
+        
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let store = SqlStore::new(&url).await.unwrap();
+        
+        // Insert items
+        store.put(&test_item("a1", "alpha")).await.unwrap();
+        store.put(&test_item("a2", "alpha")).await.unwrap();
+        store.put(&test_item("a3", "alpha")).await.unwrap();
+        store.put(&test_item("b1", "beta")).await.unwrap();
+        
+        assert_eq!(store.count_by_state("alpha").await.unwrap(), 3);
+        assert_eq!(store.count_by_state("beta").await.unwrap(), 1);
+        assert_eq!(store.count_by_state("gamma").await.unwrap(), 0);
+        
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn test_list_state_ids() {
+        let db_path = temp_db_path("list_state_ids");
+        let _ = std::fs::remove_file(&db_path);
+        
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let store = SqlStore::new(&url).await.unwrap();
+        
+        store.put(&test_item("id1", "pending")).await.unwrap();
+        store.put(&test_item("id2", "pending")).await.unwrap();
+        store.put(&test_item("id3", "done")).await.unwrap();
+        
+        let pending_ids = store.list_state_ids("pending", 100).await.unwrap();
+        assert_eq!(pending_ids.len(), 2);
+        assert!(pending_ids.contains(&"id1".to_string()));
+        assert!(pending_ids.contains(&"id2".to_string()));
+        
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn test_set_state() {
+        let db_path = temp_db_path("set_state");
+        let _ = std::fs::remove_file(&db_path);
+        
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let store = SqlStore::new(&url).await.unwrap();
+        
+        store.put(&test_item("item1", "pending")).await.unwrap();
+        
+        // Verify initial state
+        let before = store.get("item1").await.unwrap().unwrap();
+        assert_eq!(before.state, "pending");
+        
+        // Update state
+        let updated = store.set_state("item1", "approved").await.unwrap();
+        assert!(updated);
+        
+        // Verify new state
+        let after = store.get("item1").await.unwrap().unwrap();
+        assert_eq!(after.state, "approved");
+        
+        // Non-existent item returns false
+        let not_found = store.set_state("nonexistent", "x").await.unwrap();
+        assert!(!not_found);
+        
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn test_delete_by_state() {
+        let db_path = temp_db_path("delete_by_state");
+        let _ = std::fs::remove_file(&db_path);
+        
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let store = SqlStore::new(&url).await.unwrap();
+        
+        store.put(&test_item("keep1", "keep")).await.unwrap();
+        store.put(&test_item("keep2", "keep")).await.unwrap();
+        store.put(&test_item("del1", "delete_me")).await.unwrap();
+        store.put(&test_item("del2", "delete_me")).await.unwrap();
+        store.put(&test_item("del3", "delete_me")).await.unwrap();
+        
+        // Delete by state
+        let deleted = store.delete_by_state("delete_me").await.unwrap();
+        assert_eq!(deleted, 3);
+        
+        // Verify deleted
+        assert!(store.get("del1").await.unwrap().is_none());
+        assert!(store.get("del2").await.unwrap().is_none());
+        
+        // Verify others remain
+        assert!(store.get("keep1").await.unwrap().is_some());
+        assert!(store.get("keep2").await.unwrap().is_some());
+        
+        // Delete non-existent state returns 0
+        let zero = store.delete_by_state("nonexistent").await.unwrap();
+        assert_eq!(zero, 0);
+        
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_puts_preserve_state() {
+        let db_path = temp_db_path("multi_put_state");
+        let _ = std::fs::remove_file(&db_path);
+        
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let store = SqlStore::new(&url).await.unwrap();
+        
+        // Put multiple items with different states
+        store.put(&test_item("a", "state_a")).await.unwrap();
+        store.put(&test_item("b", "state_b")).await.unwrap();
+        store.put(&test_item("c", "state_c")).await.unwrap();
+        
+        assert_eq!(store.get("a").await.unwrap().unwrap().state, "state_a");
+        assert_eq!(store.get("b").await.unwrap().unwrap().state, "state_b");
+        assert_eq!(store.get("c").await.unwrap().unwrap().state, "state_c");
+        
+        let _ = std::fs::remove_file(&db_path);
     }
 }

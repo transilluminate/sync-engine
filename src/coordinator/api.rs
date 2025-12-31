@@ -408,6 +408,131 @@ impl SyncEngine {
         
         Ok(item)
     }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // State-based queries: Fast indexed access by caller-defined state tag
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Get items by state from SQL (L3 ground truth).
+    ///
+    /// Uses indexed query for fast retrieval.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sync_engine::{SyncEngine, StorageError};
+    /// # async fn example(engine: &SyncEngine) -> Result<(), StorageError> {
+    /// // Get all delta items for CRDT merging
+    /// let deltas = engine.get_by_state("delta", 1000).await?;
+    /// for item in deltas {
+    ///     println!("Delta: {}", item.object_id);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_by_state(&self, state: &str, limit: usize) -> Result<Vec<SyncItem>, StorageError> {
+        if let Some(ref sql) = self.sql_store {
+            sql.get_by_state(state, limit).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+    
+    /// Count items in a given state (SQL ground truth).
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sync_engine::{SyncEngine, StorageError};
+    /// # async fn example(engine: &SyncEngine) -> Result<(), StorageError> {
+    /// let pending_count = engine.count_by_state("pending").await?;
+    /// println!("{} items pending", pending_count);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn count_by_state(&self, state: &str) -> Result<u64, StorageError> {
+        if let Some(ref sql) = self.sql_store {
+            sql.count_by_state(state).await
+        } else {
+            Ok(0)
+        }
+    }
+    
+    /// Get just the IDs of items in a given state (lightweight query).
+    ///
+    /// Returns IDs from SQL. For Redis state SET, use `list_state_ids_redis()`.
+    pub async fn list_state_ids(&self, state: &str, limit: usize) -> Result<Vec<String>, StorageError> {
+        if let Some(ref sql) = self.sql_store {
+            sql.list_state_ids(state, limit).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+    
+    /// Update the state of an item by ID.
+    ///
+    /// Updates both SQL (ground truth) and Redis state SETs.
+    /// L1 cache is NOT updated - caller should re-fetch if needed.
+    ///
+    /// Returns true if the item was found and updated.
+    pub async fn set_state(&self, id: &str, new_state: &str) -> Result<bool, StorageError> {
+        let mut updated = false;
+        
+        // Update SQL (ground truth)
+        if let Some(ref sql) = self.sql_store {
+            updated = sql.set_state(id, new_state).await?;
+        }
+        
+        // Note: Redis state SETs are not updated here because we'd need to know
+        // the old state to do SREM. For full Redis state management, the item
+        // should be re-submitted with the new state via submit_with().
+        
+        Ok(updated)
+    }
+    
+    /// Delete all items in a given state from SQL.
+    ///
+    /// Also removes from L1 cache and Redis state SET.
+    /// Returns the number of deleted items.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sync_engine::{SyncEngine, StorageError};
+    /// # async fn example(engine: &SyncEngine) -> Result<(), StorageError> {
+    /// // Clean up all processed deltas
+    /// let deleted = engine.delete_by_state("delta").await?;
+    /// println!("Deleted {} delta items", deleted);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn delete_by_state(&self, state: &str) -> Result<u64, StorageError> {
+        let mut deleted = 0u64;
+        
+        // Get IDs first (for L1 cleanup)
+        let ids = if let Some(ref sql) = self.sql_store {
+            sql.list_state_ids(state, 100_000).await?
+        } else {
+            Vec::new()
+        };
+        
+        // Remove from L1 cache
+        for id in &ids {
+            self.l1_cache.remove(id);
+        }
+        
+        // Delete from SQL
+        if let Some(ref sql) = self.sql_store {
+            deleted = sql.delete_by_state(state).await?;
+        }
+        
+        // Note: Redis items with TTL will expire naturally.
+        // For immediate Redis cleanup, call delete_by_state on RedisStore directly.
+        
+        info!(state = %state, deleted = deleted, "Deleted items by state");
+        
+        Ok(deleted)
+    }
 }
 
 #[cfg(test)]

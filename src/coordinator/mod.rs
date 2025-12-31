@@ -396,6 +396,11 @@ impl SyncEngine {
         let id = item.object_id.clone();
         let item_bytes = item.content.len();
 
+        // Apply state override from options (if provided)
+        if let Some(ref state) = options.state {
+            item.state = state.clone();
+        }
+        
         // Attach options to item (travels through batch pipeline)
         item.submit_options = Some(options);
 

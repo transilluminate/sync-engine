@@ -112,6 +112,7 @@ impl RedisStore {
     ///   "version": 1,
     ///   "timestamp": 1767084657058,
     ///   "payload_hash": "abc123...",
+    ///   "state": "default",
     ///   "payload": {"name": "Alice", ...},
     ///   "audit": {"batch": "...", "trace": "...", "home": "..."}
     /// }
@@ -137,6 +138,7 @@ impl RedisStore {
         let mut doc = serde_json::json!({
             "version": item.version,
             "timestamp": item.updated_at,
+            "state": item.state,
             "payload": payload
         });
         
@@ -163,6 +165,7 @@ impl RedisStore {
         let version = doc.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
         let updated_at = doc.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
         let merkle_root = doc.get("payload_hash").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let state = doc.get("state").and_then(|v| v.as_str()).unwrap_or("default").to_string();
         
         // Audit fields (nested)
         let audit = doc.get("audit");
@@ -185,6 +188,7 @@ impl RedisStore {
             trace_parent,
             merkle_root,
             home_instance_id,
+            state,
         ))
     }
 }
@@ -346,6 +350,7 @@ impl CacheStore for RedisStore {
 impl RedisStore {
     /// Pipelined batch write implementation with content-type aware storage.
     /// Uses JSON.SET for JSON content, SET for binary blobs.
+    /// Also adds items to state SETs for fast state-based queries.
     async fn put_batch_impl(&self, items: &[SyncItem], ttl_secs: Option<u64>) -> Result<BatchWriteResult, StorageError> {
         if items.is_empty() {
             return Ok(BatchWriteResult {
@@ -358,21 +363,23 @@ impl RedisStore {
         // Prepare items: JSON → JSON.SET document, Binary → serialized bytes
         #[derive(Clone)]
         enum PreparedItem {
-            Json { key: String, doc: String },
-            Blob { key: String, data: Vec<u8> },
+            Json { key: String, id: String, state: String, doc: String },
+            Blob { key: String, id: String, state: String, data: Vec<u8> },
         }
         
         let prepared: Result<Vec<_>, _> = items.iter()
             .map(|item| {
                 let prefixed_key = self.prefixed_key(&item.object_id);
+                let id = item.object_id.clone();
+                let state = item.state.clone();
                 match item.content_type {
                     ContentType::Json => {
                         Self::build_json_document(item)
-                            .map(|doc| PreparedItem::Json { key: prefixed_key, doc })
+                            .map(|doc| PreparedItem::Json { key: prefixed_key, id, state, doc })
                     }
                     ContentType::Binary => {
                         serde_json::to_vec(item)
-                            .map(|bytes| PreparedItem::Blob { key: prefixed_key, data: bytes })
+                            .map(|bytes| PreparedItem::Blob { key: prefixed_key, id, state, data: bytes })
                             .map_err(|e| StorageError::Backend(e.to_string()))
                     }
                 }
@@ -382,29 +389,37 @@ impl RedisStore {
         let count = prepared.len();
 
         let conn = self.connection.clone();
+        let prefix = self.prefix.clone();
         
         retry("redis_put_batch", &RetryConfig::query(), || {
             let mut conn = conn.clone();
             let prepared = prepared.clone();
+            let prefix = prefix.clone();
             async move {
                 let mut pipeline = pipe();
                 
                 for item in &prepared {
                     match item {
-                        PreparedItem::Json { key, doc } => {
+                        PreparedItem::Json { key, id, state, doc } => {
                             // JSON.SET key $ <json>
                             pipeline.cmd("JSON.SET").arg(key).arg("$").arg(doc);
                             if let Some(ttl) = ttl_secs {
                                 pipeline.expire(key, ttl as i64);
                             }
+                            // Add to state SET: sync:state:{state}
+                            let state_key = format!("{}state:{}", prefix, state);
+                            pipeline.cmd("SADD").arg(&state_key).arg(id);
                         }
-                        PreparedItem::Blob { key, data } => {
+                        PreparedItem::Blob { key, id, state, data } => {
                             // SET for binary content
                             if let Some(ttl) = ttl_secs {
                                 pipeline.cmd("SETEX").arg(key).arg(ttl as i64).arg(data.as_slice());
                             } else {
                                 pipeline.set(key, data.as_slice());
                             }
+                            // Add to state SET
+                            let state_key = format!("{}state:{}", prefix, state);
+                            pipeline.cmd("SADD").arg(&state_key).arg(id);
                         }
                     }
                 }
@@ -449,5 +464,123 @@ impl RedisStore {
         })
         .await
         .map_err(|e: redis::RedisError| StorageError::Backend(e.to_string()))
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // State SET operations: O(1) membership, fast iteration by state
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Get all IDs in a given state (from Redis SET).
+    ///
+    /// Returns IDs without prefix - ready to use with `get()`.
+    pub async fn list_state_ids(&self, state: &str) -> Result<Vec<String>, StorageError> {
+        let mut conn = self.connection.clone();
+        let state_key = format!("{}state:{}", self.prefix, state);
+        
+        let ids: Vec<String> = cmd("SMEMBERS")
+            .arg(&state_key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| StorageError::Backend(format!("Failed to get state members: {}", e)))?;
+        
+        Ok(ids)
+    }
+    
+    /// Count items in a given state (SET cardinality).
+    pub async fn count_by_state(&self, state: &str) -> Result<u64, StorageError> {
+        let mut conn = self.connection.clone();
+        let state_key = format!("{}state:{}", self.prefix, state);
+        
+        let count: u64 = cmd("SCARD")
+            .arg(&state_key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| StorageError::Backend(format!("Failed to count state: {}", e)))?;
+        
+        Ok(count)
+    }
+    
+    /// Check if an ID is in a given state (SET membership).
+    pub async fn is_in_state(&self, id: &str, state: &str) -> Result<bool, StorageError> {
+        let mut conn = self.connection.clone();
+        let state_key = format!("{}state:{}", self.prefix, state);
+        
+        let is_member: bool = cmd("SISMEMBER")
+            .arg(&state_key)
+            .arg(id)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| StorageError::Backend(format!("Failed to check state membership: {}", e)))?;
+        
+        Ok(is_member)
+    }
+    
+    /// Move an ID from one state to another (atomic SMOVE).
+    ///
+    /// Returns true if the item was moved, false if it wasn't in the source state.
+    pub async fn move_state(&self, id: &str, from_state: &str, to_state: &str) -> Result<bool, StorageError> {
+        let mut conn = self.connection.clone();
+        let from_key = format!("{}state:{}", self.prefix, from_state);
+        let to_key = format!("{}state:{}", self.prefix, to_state);
+        
+        let moved: bool = cmd("SMOVE")
+            .arg(&from_key)
+            .arg(&to_key)
+            .arg(id)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| StorageError::Backend(format!("Failed to move state: {}", e)))?;
+        
+        Ok(moved)
+    }
+    
+    /// Remove an ID from a state SET.
+    pub async fn remove_from_state(&self, id: &str, state: &str) -> Result<bool, StorageError> {
+        let mut conn = self.connection.clone();
+        let state_key = format!("{}state:{}", self.prefix, state);
+        
+        let removed: u32 = cmd("SREM")
+            .arg(&state_key)
+            .arg(id)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| StorageError::Backend(format!("Failed to remove from state: {}", e)))?;
+        
+        Ok(removed > 0)
+    }
+    
+    /// Delete all items in a state (both the SET and the actual keys).
+    ///
+    /// Returns the number of items deleted.
+    pub async fn delete_by_state(&self, state: &str) -> Result<u64, StorageError> {
+        let mut conn = self.connection.clone();
+        let state_key = format!("{}state:{}", self.prefix, state);
+        
+        // Get all IDs in this state
+        let ids: Vec<String> = cmd("SMEMBERS")
+            .arg(&state_key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| StorageError::Backend(format!("Failed to get state members: {}", e)))?;
+        
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        
+        let count = ids.len() as u64;
+        
+        // Delete all the keys and the state SET
+        let mut pipeline = pipe();
+        for id in &ids {
+            let key = self.prefixed_key(id);
+            pipeline.del(&key);
+        }
+        pipeline.del(&state_key);
+        
+        pipeline.query_async::<()>(&mut conn)
+            .await
+            .map_err(|e| StorageError::Backend(format!("Failed to delete state items: {}", e)))?;
+        
+        Ok(count)
     }
 }
