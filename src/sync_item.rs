@@ -220,6 +220,17 @@ impl SyncItem {
         item.content_type = ContentType::Json; // Explicit, since we know it's JSON
         item
     }
+
+    /// Create a new SyncItem from any serializable type.
+    ///
+    /// This avoids creating an intermediate `serde_json::Value` if you have a struct.
+    /// This is more efficient than `from_json` if you already have a typed object.
+    pub fn from_serializable<T: Serialize>(object_id: String, value: &T) -> Result<Self, serde_json::Error> {
+        let content = serde_json::to_vec(value)?;
+        let mut item = Self::new(object_id, content);
+        item.content_type = ContentType::Json;
+        Ok(item)
+    }
     
     /// Reconstruct a SyncItem from stored components (used by storage backends).
     /// 

@@ -264,9 +264,12 @@ impl SyncEngine {
         let total = items.len();
         let mut succeeded = 0;
         
+        // Lock batcher once for the whole batch
+        let mut batcher = self.l2_batcher.lock().await;
+        
         for item in items {
             self.insert_l1(item.clone());
-            self.l2_batcher.lock().await.add(item);
+            batcher.add(item);
             succeeded += 1;
         }
         
