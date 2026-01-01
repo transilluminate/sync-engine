@@ -191,6 +191,29 @@ impl RedisStore {
             state,
         ))
     }
+
+    /// Parse FT.SEARCH NOCONTENT response into a list of keys.
+    /// Response format: [count, key1, key2, ...]
+    fn parse_ft_search_response(value: redis::Value) -> Result<Vec<String>, redis::RedisError> {
+        match value {
+            redis::Value::Array(arr) => {
+                if arr.is_empty() {
+                    return Ok(vec![]);
+                }
+                // First element is count, rest are keys
+                let keys: Vec<String> = arr.into_iter()
+                    .skip(1) // Skip count
+                    .filter_map(|v| match v {
+                        redis::Value::BulkString(bytes) => String::from_utf8(bytes).ok(),
+                        redis::Value::SimpleString(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect();
+                Ok(keys)
+            }
+            _ => Ok(vec![]),
+        }
+    }
 }
 
 #[async_trait]
@@ -344,6 +367,77 @@ impl CacheStore for RedisStore {
     /// Write a batch of items with optional TTL.
     async fn put_batch_with_ttl(&self, items: &[SyncItem], ttl_secs: Option<u64>) -> Result<BatchWriteResult, StorageError> {
         self.put_batch_impl(items, ttl_secs).await
+    }
+
+    /// Create a RediSearch index (FT.CREATE).
+    async fn ft_create(&self, args: &[String]) -> Result<(), StorageError> {
+        let conn = self.connection.clone();
+
+        retry("redis_ft_create", &RetryConfig::query(), || {
+            let mut conn = conn.clone();
+            let args = args.to_vec();
+            async move {
+                let mut cmd = cmd("FT.CREATE");
+                for arg in &args {
+                    cmd.arg(arg);
+                }
+                let _: () = cmd.query_async(&mut conn).await?;
+                Ok(())
+            }
+        })
+        .await
+        .map_err(|e: redis::RedisError| StorageError::Backend(e.to_string()))
+    }
+
+    /// Drop a RediSearch index (FT.DROPINDEX).
+    async fn ft_dropindex(&self, index: &str) -> Result<(), StorageError> {
+        let conn = self.connection.clone();
+        let index = index.to_string();
+
+        retry("redis_ft_dropindex", &RetryConfig::query(), || {
+            let mut conn = conn.clone();
+            let index = index.clone();
+            async move {
+                let _: () = cmd("FT.DROPINDEX")
+                    .arg(&index)
+                    .query_async(&mut conn)
+                    .await?;
+                Ok(())
+            }
+        })
+        .await
+        .map_err(|e: redis::RedisError| StorageError::Backend(e.to_string()))
+    }
+
+    /// Search using RediSearch (FT.SEARCH).
+    async fn ft_search(&self, index: &str, query: &str, limit: usize) -> Result<Vec<String>, StorageError> {
+        let conn = self.connection.clone();
+        let index = index.to_string();
+        let query = query.to_string();
+
+        retry("redis_ft_search", &RetryConfig::query(), || {
+            let mut conn = conn.clone();
+            let index = index.clone();
+            let query = query.clone();
+            async move {
+                // FT.SEARCH index query LIMIT 0 limit NOCONTENT
+                // NOCONTENT returns only keys, not document content
+                let result: redis::Value = cmd("FT.SEARCH")
+                    .arg(&index)
+                    .arg(&query)
+                    .arg("LIMIT")
+                    .arg(0)
+                    .arg(limit)
+                    .arg("NOCONTENT")
+                    .query_async(&mut conn)
+                    .await?;
+
+                // Parse FT.SEARCH response: [count, key1, key2, ...]
+                Self::parse_ft_search_response(result)
+            }
+        })
+        .await
+        .map_err(|e: redis::RedisError| StorageError::Backend(e.to_string()))
     }
 }
 

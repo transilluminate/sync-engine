@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use crate::sync_item::SyncItem;
+use crate::search::SqlParam;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -8,6 +9,8 @@ pub enum StorageError {
     NotFound,
     #[error("Storage backend error: {0}")]
     Backend(String),
+    #[error("Connection error: {0}")]
+    Connection(String),
     #[error("Data corruption detected for '{id}': expected hash {expected}, got {actual}")]
     Corruption {
         id: String,
@@ -56,6 +59,25 @@ pub trait CacheStore: Send + Sync {
             verified: true,
         })
     }
+
+    /// Create a RediSearch index (FT.CREATE).
+    async fn ft_create(&self, args: &[String]) -> Result<(), StorageError> {
+        let _ = args;
+        Err(StorageError::Backend("FT.CREATE not supported".into()))
+    }
+
+    /// Drop a RediSearch index (FT.DROPINDEX).
+    async fn ft_dropindex(&self, index: &str) -> Result<(), StorageError> {
+        let _ = index;
+        Err(StorageError::Backend("FT.DROPINDEX not supported".into()))
+    }
+
+    /// Search using RediSearch (FT.SEARCH).
+    /// Returns matching keys.
+    async fn ft_search(&self, index: &str, query: &str, limit: usize) -> Result<Vec<String>, StorageError> {
+        let _ = (index, query, limit);
+        Err(StorageError::Backend("FT.SEARCH not supported".into()))
+    }
 }
 
 #[async_trait]
@@ -87,4 +109,11 @@ pub trait ArchiveStore: Send + Sync {
     
     /// Count total items in store.
     async fn count_all(&self) -> Result<u64, StorageError>;
+
+    /// Search using SQL WHERE clause with JSON_EXTRACT.
+    /// Returns matching items.
+    async fn search(&self, where_clause: &str, params: &[SqlParam], limit: usize) -> Result<Vec<SyncItem>, StorageError> {
+        let _ = (where_clause, params, limit);
+        Err(StorageError::Backend("SQL search not supported".into()))
+    }
 }

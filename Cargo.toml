@@ -1,6 +1,6 @@
 [package]
 name = "sync-engine"
-version = "0.1.7"
+version = "0.2.0"
 edition = "2021"
 authors = ["Adrian Robinson <adrian.j.robinson@gmail.com>"]
 description = "High-performance tiered sync engine with L1/L2/L3 caching and Redis/SQL backends"

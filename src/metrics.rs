@@ -330,6 +330,61 @@ pub fn record_merkle_operation(store: &str, operation: &str, success: bool) {
     .increment(1);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// SEARCH - RediSearch and SQL search metrics
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Record a search query execution
+pub fn record_search_query(backend: &str, status: &str) {
+    counter!(
+        "sync_engine_search_queries_total",
+        "backend" => backend.to_string(),
+        "status" => status.to_string()
+    )
+    .increment(1);
+}
+
+/// Record search query latency
+pub fn record_search_latency(backend: &str, duration: Duration) {
+    histogram!(
+        "sync_engine_search_seconds",
+        "backend" => backend.to_string()
+    )
+    .record(duration.as_secs_f64());
+}
+
+/// Record search result count
+pub fn record_search_results(count: usize) {
+    histogram!("sync_engine_search_results").record(count as f64);
+}
+
+/// Record search cache hit/miss
+pub fn record_search_cache(hit: bool) {
+    let outcome = if hit { "hit" } else { "miss" };
+    counter!(
+        "sync_engine_search_cache_total",
+        "outcome" => outcome
+    )
+    .increment(1);
+}
+
+/// Set search cache stats gauge
+pub fn set_search_cache_stats(entries: usize, hit_rate: f64) {
+    gauge!("sync_engine_search_cache_entries").set(entries as f64);
+    gauge!("sync_engine_search_cache_hit_rate").set(hit_rate);
+}
+
+/// Record index creation/drop
+pub fn record_search_index_operation(operation: &str, success: bool) {
+    let status = if success { "success" } else { "failure" };
+    counter!(
+        "sync_engine_search_index_operations_total",
+        "operation" => operation.to_string(),
+        "status" => status
+    )
+    .increment(1);
+}
+
 /// A timing guard that records latency on drop
 pub struct LatencyTimer {
     tier: &'static str,
@@ -447,5 +502,32 @@ mod tests {
         set_engine_state("Created");
         set_engine_state("Connecting");
         set_engine_state("Running");
+    }
+    
+    #[test]
+    fn test_search_metrics() {
+        // Search queries
+        record_search_query("redis", "success");
+        record_search_query("sql", "success");
+        record_search_query("redis", "error");
+        
+        // Search latency
+        record_search_latency("redis", Duration::from_micros(500));
+        record_search_latency("sql", Duration::from_millis(5));
+        record_search_latency("cache", Duration::from_micros(10));
+        
+        // Search results
+        record_search_results(42);
+        record_search_results(0);
+        
+        // Cache stats
+        record_search_cache(true);
+        record_search_cache(false);
+        set_search_cache_stats(100, 0.85);
+        
+        // Index operations
+        record_search_index_operation("create", true);
+        record_search_index_operation("drop", true);
+        record_search_index_operation("create", false);
     }
 }

@@ -72,7 +72,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sync-engine = "0.1.7"
+sync-engine = "0.2"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
@@ -194,6 +194,52 @@ engine.delete_prefix("delta:user.123:").await?;
 
 Prefix scan queries SQL directly (ground truth) and leverages the primary key index for efficient `LIKE 'prefix%'` queries.
 
+## Full-Text Search
+
+Create search indices on your JSON data for RediSearch-powered queries with SQL fallback:
+
+```rust
+use sync_engine::search::{SearchIndex, Query};
+use sync_engine::coordinator::SearchTier;
+
+// Define a search index (the engine handles $.payload paths internally)
+let index = SearchIndex::new("users", "crdt:users:")
+    .text("name")              // Full-text searchable
+    .text("email")
+    .numeric_sortable("age")   // Numeric with range queries
+    .tag("roles");             // Exact tag matching
+
+engine.create_search_index(index).await?;
+
+// Insert documents as usual
+let user = SyncItem::from_json("crdt:users:alice", json!({
+    "name": "Alice Smith",
+    "email": "alice@example.com",
+    "age": 28,
+    "roles": ["admin", "developer"]
+}));
+engine.submit(user).await?;
+
+// Query with fluent builder API
+let query = Query::field_eq("name", "Alice Smith")
+    .and(Query::numeric_range("age", Some(25.0), Some(35.0)));
+
+let results = engine.search("users", &query, 100).await?;
+
+// Tag-based queries
+let admins = engine.search("users", &Query::tags("roles", vec!["admin"]), 100).await?;
+
+// Use SearchTier for control over Redis vs SQL
+let redis_only = engine.search_with_options("users", &query, SearchTier::RedisOnly, 100).await?;
+```
+
+**Search Features:**
+- **Text fields**: Full-text search with phrase matching
+- **Numeric fields**: Range queries with optional sorting
+- **Tag fields**: Exact multi-value matching with OR semantics
+- **Compound queries**: `.and()`, `.or()`, `.not()` for complex filters
+- **Search cache**: Merkle-invalidated SQL result caching for hybrid queries
+
 ## Configuration
 
 | Option | Default | Description |
@@ -214,12 +260,12 @@ Comprehensive test suite with 251 tests covering unit, property-based, integrati
 
 | Test Suite | Count | Description |
 |------------|-------|-------------|
-| **Unit Tests** | 178 | Fast, no external deps |
-| **Doc Tests** | 27 | Example verification |
+| **Unit Tests** | 232 | Fast, no external deps |
+| **Doc Tests** | 31 | Example verification |
 | **Property Tests** | 12 | Proptest fuzzing for invariants |
-| **Integration Tests** | 24 | Real Redis Stack/MySQL via testcontainers |
+| **Integration Tests** | 26 | Real Redis Stack/MySQL via testcontainers |
 | **Chaos Tests** | 10 | Failure injection, container killing |
-| **Total** | **251** | ~74% code coverage |
+| **Total** | **311** | ~75% code coverage |
 
 ### Running Tests
 

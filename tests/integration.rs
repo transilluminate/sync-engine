@@ -1511,3 +1511,184 @@ async fn happy_prefix_scan() {
     engine.shutdown().await;
     cleanup_wal_files(&wal_path);
 }
+
+// =============================================================================
+// Search Tests - RediSearch Integration
+// =============================================================================
+
+#[tokio::test]
+#[ignore] // Requires Docker with redis-stack
+async fn happy_search_with_redisearch() {
+    use sync_engine::search::{SearchIndex, Query};
+    use sync_engine::coordinator::SearchTier;
+
+    let docker = Cli::default();
+    let redis = redis_container(&docker);
+    let redis_port = redis.get_host_port_ipv4(6379);
+    
+    let wal_path = unique_wal_path("search");
+    let config = SyncEngineConfig {
+        redis_url: Some(format!("redis://127.0.0.1:{}", redis_port)),
+        sql_url: None,
+        l1_max_bytes: 10 * 1024 * 1024,
+        wal_path: Some(wal_path.clone()),
+        batch_flush_ms: 50,
+        batch_flush_count: 5,
+        ..Default::default()
+    };
+
+    let (_tx, rx) = watch::channel(config.clone());
+    let mut engine = SyncEngine::new(config, rx);
+    
+    engine.start().await.expect("Failed to start engine");
+    assert!(engine.is_ready());
+
+    // 1. Create search index
+    // Note: User data is wrapped in "payload" by RedisStore, so paths are $.payload.*
+    let index = SearchIndex::new("users", "crdt:users:")
+        .text_at("name", "$.payload.name")
+        .text_at("email", "$.payload.email")
+        .numeric_sortable_at("age", "$.payload.age")
+        .tag_at("roles", "$.payload.roles[*]");
+
+    engine.create_search_index(index).await
+        .expect("Failed to create search index");
+
+    // 2. Insert some test documents
+    let users = vec![
+        ("alice", "Alice Smith", "alice@example.com", 28, vec!["admin", "developer"]),
+        ("bob", "Bob Jones", "bob@example.com", 35, vec!["developer"]),
+        ("carol", "Carol White", "carol@example.com", 42, vec!["manager"]),
+        ("dave", "Dave Brown", "dave@example.com", 25, vec!["developer", "intern"]),
+        ("eve", "Eve Davis", "eve@example.com", 31, vec!["admin"]),
+    ];
+
+    for (id, name, email, age, roles) in &users {
+        let item = SyncItem::from_json(
+            format!("crdt:users:{}", id),
+            json!({
+                "name": name,
+                "email": email,
+                "age": age,
+                "roles": roles,
+            }),
+        );
+        engine.submit(item).await.expect("Failed to submit");
+    }
+
+    // Force flush and wait for indexing
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    engine.force_flush().await;
+    tokio::time::sleep(Duration::from_millis(500)).await; // Wait for RediSearch indexing
+
+    // 3. Test simple field query
+    let query = Query::field_eq("name", "Alice Smith");
+    let results = engine.search_with_options("users", &query, SearchTier::RedisOnly, 100).await
+        .expect("Search failed");
+    assert_eq!(results.items.len(), 1, "Should find Alice");
+    assert!(results.items[0].object_id.contains("alice"));
+
+    // 4. Test numeric range query
+    let query = Query::numeric_range("age", Some(30.0), Some(45.0));
+    let results = engine.search_with_options("users", &query, SearchTier::RedisOnly, 100).await
+        .expect("Search failed");
+    assert_eq!(results.items.len(), 3, "Should find Bob, Carol, Eve (age 30-45)");
+
+    // 5. Test tag query
+    let query = Query::tags("roles", vec!["admin".to_string()]);
+    let results = engine.search_with_options("users", &query, SearchTier::RedisOnly, 100).await
+        .expect("Search failed");
+    assert_eq!(results.items.len(), 2, "Should find Alice and Eve (admins)");
+
+    // 6. Test combined query (AND)
+    let query = Query::tags("roles", vec!["developer".to_string()])
+        .and(Query::numeric_range("age", Some(30.0), None));
+    let results = engine.search_with_options("users", &query, SearchTier::RedisOnly, 100).await
+        .expect("Search failed");
+    assert_eq!(results.items.len(), 1, "Should find Bob (developer, age >= 30)");
+
+    // 7. Test raw query
+    let results = engine.search_raw("users", "@roles:{admin}", 10).await
+        .expect("Raw search failed");
+    assert_eq!(results.len(), 2, "Raw query should find 2 admins");
+
+    // 8. Drop index
+    engine.drop_search_index("users").await
+        .expect("Failed to drop index");
+
+    engine.shutdown().await;
+    cleanup_wal_files(&wal_path);
+}
+
+#[tokio::test]
+#[ignore] // Requires Docker
+async fn happy_search_cache_invalidation() {
+    use sync_engine::search::{SearchIndex, Query};
+    use sync_engine::coordinator::SearchTier;
+
+    let docker = Cli::default();
+    let redis = redis_container(&docker);
+    let redis_port = redis.get_host_port_ipv4(6379);
+    
+    let wal_path = unique_wal_path("search_cache");
+    let config = SyncEngineConfig {
+        redis_url: Some(format!("redis://127.0.0.1:{}", redis_port)),
+        sql_url: None,
+        l1_max_bytes: 10 * 1024 * 1024,
+        wal_path: Some(wal_path.clone()),
+        batch_flush_ms: 50,
+        batch_flush_count: 5,
+        ..Default::default()
+    };
+
+    let (_tx, rx) = watch::channel(config.clone());
+    let mut engine = SyncEngine::new(config, rx);
+    
+    engine.start().await.expect("Failed to start engine");
+
+    // Create index - use $.payload.* paths since RedisStore wraps user data
+    let index = SearchIndex::new("items", "crdt:items:")
+        .text_at("title", "$.payload.title")
+        .tag_at("status", "$.payload.status");
+
+    engine.create_search_index(index).await
+        .expect("Failed to create index");
+
+    // Insert initial data
+    let item = SyncItem::from_json(
+        "crdt:items:1".to_string(),
+        json!({"title": "First Item", "status": "active"}),
+    );
+    engine.submit(item).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    engine.force_flush().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // First search
+    let query = Query::tags("status", vec!["active".to_string()]);
+    let results1 = engine.search_with_options("items", &query, SearchTier::RedisOnly, 100).await.unwrap();
+    assert_eq!(results1.items.len(), 1);
+
+    // Check cache stats
+    let stats = engine.search_cache_stats();
+    assert!(stats.is_some());
+
+    // Add another item - this should invalidate cache via merkle change
+    let item2 = SyncItem::from_json(
+        "crdt:items:2".to_string(),
+        json!({"title": "Second Item", "status": "active"}),
+    );
+    engine.submit(item2).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    engine.force_flush().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Second search should find both items
+    let results2 = engine.search_with_options("items", &query, SearchTier::RedisOnly, 100).await.unwrap();
+    assert_eq!(results2.items.len(), 2, "Should find both active items after cache invalidation");
+
+    engine.shutdown().await;
+    cleanup_wal_files(&wal_path);
+}

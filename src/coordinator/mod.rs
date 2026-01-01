@@ -38,9 +38,11 @@ mod api;
 mod lifecycle;
 mod flush;
 mod merkle_api;
+mod search_api;
 
 pub use types::{EngineState, ItemStatus, BatchResult};
 pub use merkle_api::MerkleDiff;
+pub use search_api::{SearchTier, SearchResult, SearchSource};
 #[allow(unused_imports)]
 use types::WriteTarget;
 
@@ -48,6 +50,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::time::Instant;
 use dashmap::DashMap;
+use parking_lot::RwLock;
 use tokio::sync::{watch, Mutex};
 use tracing::{info, warn, debug, error};
 
@@ -63,6 +66,8 @@ use crate::batching::hybrid_batcher::{HybridBatcher, BatchConfig, SizedItem};
 use crate::merkle::{RedisMerkleStore, SqlMerkleStore, MerkleBatch};
 use crate::resilience::wal::{WriteAheadLog, MysqlHealthChecker};
 use crate::eviction::tan_curve::{TanCurvePolicy, CacheEntry};
+
+use search_api::SearchState;
 
 /// Main sync engine coordinator.
 ///
@@ -131,6 +136,9 @@ pub struct SyncEngine {
 
     /// Eviction policy
     pub(super) eviction_policy: TanCurvePolicy,
+
+    /// Search state (index manager + cache)
+    pub(super) search_state: Option<Arc<RwLock<SearchState>>>,
 }
 
 impl SyncEngine {
@@ -167,6 +175,7 @@ impl SyncEngine {
             l3_wal: None,
             mysql_health: MysqlHealthChecker::new(),
             eviction_policy: TanCurvePolicy::default(),
+            search_state: Some(Arc::new(RwLock::new(SearchState::default()))),
         }
     }
 

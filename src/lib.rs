@@ -119,6 +119,7 @@ pub mod merkle;
 pub mod backpressure;
 pub mod coordinator;
 pub mod metrics;
+pub mod search;
 
 // Note: We don't expose a `tracing` module to avoid conflict with the tracing crate
 
