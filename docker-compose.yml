@@ -49,33 +49,33 @@ services:
       timeout: 3s
       retries: 3
 
-  redis-insight:
-    image: redis/redisinsight:latest
-    container_name: redis-insight
-    ports:
-      - "5540:5540"
-    environment:
-      - REDIS_HOSTS=local:redis:6379
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - REDIS_PASSWORD=""
-    depends_on:
-      redis-sync-engine:
-        condition: service_healthy
-    volumes:
-      - redis_insight_data:/data
+  # redis-insight:
+  #   image: redis/redisinsight:latest
+  #   container_name: redis-insight
+  #   ports:
+  #     - "5540:5540"
+  #   environment:
+  #     - REDIS_HOSTS=local:redis:6379
+  #     - REDIS_HOST=redis
+  #     - REDIS_PORT=6379
+  #     - REDIS_PASSWORD=""
+  #   depends_on:
+  #     redis-sync-engine:
+  #       condition: service_healthy
+  #   volumes:
+  #     - redis_insight_data:/data
 
-  adminer:
-    image: adminer:latest
-    container_name: adminer
-    ports:
-      - "8080:8080"
-    depends_on:
-      mysql-sync-engine:
-        condition: service_healthy
-    environment:
-      - ADMINER_DEFAULT_SERVER=mysql-sync-engine
-      - ADMINER_DESIGN=pepa-linha
+  # adminer:
+  #   image: adminer:latest
+  #   container_name: adminer
+  #   ports:
+  #     - "8080:8080"
+  #   depends_on:
+  #     mysql-sync-engine:
+  #       condition: service_healthy
+  #   environment:
+  #     - ADMINER_DEFAULT_SERVER=mysql-sync-engine
+  #     - ADMINER_DESIGN=pepa-linha
 
 volumes:
   mysql_data:

@@ -143,8 +143,8 @@ impl RedisStore {
         });
         
         // Only include payload_hash if non-empty
-        if !item.merkle_root.is_empty() {
-            doc["payload_hash"] = serde_json::Value::String(item.merkle_root.clone());
+        if !item.content_hash.is_empty() {
+            doc["payload_hash"] = serde_json::Value::String(item.content_hash.clone());
         }
         
         // Only include audit if there's something in it
@@ -164,7 +164,7 @@ impl RedisStore {
         // Top-level fields
         let version = doc.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
         let updated_at = doc.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
-        let merkle_root = doc.get("payload_hash").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let content_hash = doc.get("payload_hash").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let state = doc.get("state").and_then(|v| v.as_str()).unwrap_or("default").to_string();
         
         // Audit fields (nested)
@@ -186,7 +186,7 @@ impl RedisStore {
             content,
             batch_id,
             trace_parent,
-            merkle_root,
+            content_hash,
             home_instance_id,
             state,
         ))

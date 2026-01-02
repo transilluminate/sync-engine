@@ -318,7 +318,7 @@ impl SyncEngine {
 
     /// Get an item with hash verification.
     ///
-    /// If the item has a non-empty `merkle_root`, the content hash is verified.
+    /// If the item has a non-empty `content_hash`, the content hash is verified.
     /// Returns `StorageError::Corruption` if the hash doesn't match.
     #[tracing::instrument(skip(self), fields(verified))]
     pub async fn get_verified(&self, id: &str) -> Result<Option<SyncItem>, StorageError> {
@@ -327,18 +327,18 @@ impl SyncEngine {
             None => return Ok(None),
         };
 
-        // Verify hash if item has merkle_root set
-        if !item.merkle_root.is_empty() {
+        // Verify hash if item has content_hash set
+        if !item.content_hash.is_empty() {
             use sha2::{Sha256, Digest};
             
             let computed = Sha256::digest(&item.content);
             let computed_hex = hex::encode(computed);
             
-            if computed_hex != item.merkle_root {
+            if computed_hex != item.content_hash {
                 tracing::Span::current().record("verified", false);
                 warn!(
                     id = %id,
-                    expected = %item.merkle_root,
+                    expected = %item.content_hash,
                     actual = %computed_hex,
                     "Data corruption detected!"
                 );
@@ -348,7 +348,7 @@ impl SyncEngine {
                 
                 return Err(StorageError::Corruption {
                     id: id.to_string(),
-                    expected: item.merkle_root.clone(),
+                    expected: item.content_hash.clone(),
                     actual: computed_hex,
                 });
             }

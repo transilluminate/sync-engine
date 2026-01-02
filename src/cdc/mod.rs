@@ -11,7 +11,7 @@
 //! XADD {prefix}__local__:cdc MAXLEN ~ 100000 *
 //!   op    "PUT"
 //!   key   "uk.nhs.patient.12345"
-//!   hash  "a1b2c3..."                # merkle_root for dedup
+//!   hash  "a1b2c3..."                # content_hash for dedup
 //!   data  <zstd(content)>            # compressed payload
 //!   meta  '{"content_type":"json","version":3,"updated_at":1735776000000}'
 //! ```
@@ -71,7 +71,7 @@ pub struct CdcEntry {
     pub op: CdcOp,
     /// Object ID (key)
     pub key: String,
-    /// Content hash for dedup (merkle_root) - only for PUT
+    /// Content hash for dedup (SHA256 of content) - only for PUT
     pub hash: Option<String>,
     /// Compressed data - only for PUT
     pub data: Option<Vec<u8>>,

@@ -90,6 +90,54 @@ impl SyncEngine {
         self.l1_cache.contains_key(id) || self.l3_filter.should_check_l3(id)
     }
 
+    /// Check if the item at `key` has the given content hash.
+    ///
+    /// This is the semantic API for CDC deduplication in replication.
+    /// Returns `true` if the item exists AND its content hash matches.
+    /// Returns `false` if item doesn't exist OR hash differs.
+    ///
+    /// # Arguments
+    /// * `id` - Object ID
+    /// * `content_hash` - SHA256 hash of content (hex-encoded string)
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sync_engine::SyncEngine;
+    /// # async fn example(engine: &SyncEngine) {
+    /// // Skip replication if we already have this version
+    /// let incoming_hash = "abc123...";
+    /// if engine.is_current("patient.123", incoming_hash).await {
+    ///     println!("Already up to date, skipping");
+    ///     return;
+    /// }
+    /// # }
+    /// ```
+    pub async fn is_current(&self, id: &str, content_hash: &str) -> bool {
+        // Check L1 first (fastest)
+        if let Some(item) = self.l1_cache.get(id) {
+            return item.content_hash == content_hash;
+        }
+
+        // Check L2 (if available)
+        if let Some(ref l2) = self.l2_store {
+            if let Ok(Some(item)) = l2.get(id).await {
+                return item.content_hash == content_hash;
+            }
+        }
+
+        // Check L3 (ground truth)
+        if let Some(ref l3) = self.l3_store {
+            if self.l3_filter.should_check_l3(id) {
+                if let Ok(Some(item)) = l3.get(id).await {
+                    return item.content_hash == content_hash;
+                }
+            }
+        }
+
+        false
+    }
+
     /// Get the current count of items in L1 cache.
     #[must_use]
     #[inline]

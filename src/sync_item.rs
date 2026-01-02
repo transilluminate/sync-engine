@@ -145,8 +145,8 @@ pub struct SyncItem {
     pub priority_score: f64,
     /// SHA256 hash of the content (hex-encoded).
     /// Computed eagerly on creation for CDC dedup and integrity checks.
-    /// Named `merkle_root` for historical reasons but is really a content hash.
-    pub merkle_root: String,
+    #[serde(alias = "merkle_root")]  // Wire compat with v0.2.x
+    pub content_hash: String,
     /// Timestamp of last access (epoch millis)
     pub last_accessed: u64,
     /// Number of times accessed
@@ -201,7 +201,7 @@ impl SyncItem {
     pub fn new(object_id: String, content: Vec<u8>) -> Self {
         let content_type = ContentType::detect(&content);
         // Compute content hash eagerly for CDC dedup
-        let merkle_root = hex::encode(Sha256::digest(&content));
+        let content_hash = hex::encode(Sha256::digest(&content));
         Self {
             object_id,
             version: 1,
@@ -214,7 +214,7 @@ impl SyncItem {
             trace_parent: None,
             trace_state: None,
             priority_score: 0.0,
-            merkle_root,
+            content_hash,
             last_accessed: 0,
             access_count: 0,
             content,
@@ -261,7 +261,7 @@ impl SyncItem {
         content: Vec<u8>,
         batch_id: Option<String>,
         trace_parent: Option<String>,
-        merkle_root: String,
+        content_hash: String,
         home_instance_id: Option<String>,
         state: String,
     ) -> Self {
@@ -274,7 +274,7 @@ impl SyncItem {
             trace_parent,
             trace_state: None,
             priority_score: 0.0,
-            merkle_root,
+            content_hash,
             last_accessed: 0,
             access_count: 0,
             content,
@@ -367,7 +367,7 @@ impl SizedItem for SyncItem {
                 + self.object_id.len()
                 + self.trace_parent.as_ref().map_or(0, String::len)
                 + self.trace_state.as_ref().map_or(0, String::len)
-                + self.merkle_root.len()
+                + self.content_hash.len()
                 + self.content.len()
                 + self.home_instance_id.as_ref().map_or(0, String::len)
         })
@@ -398,7 +398,7 @@ mod tests {
         assert_eq!(item.priority_score, 0.0);
         // Content hash is computed eagerly for CDC dedup
         // SHA256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
-        assert_eq!(item.merkle_root, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+        assert_eq!(item.content_hash, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
         assert_eq!(item.last_accessed, 0);
         assert_eq!(item.access_count, 0);
         assert!(item.home_instance_id.is_none());
@@ -593,6 +593,7 @@ mod tests {
     #[test]
     fn test_state_deserialization_default() {
         // JSON without state field should default to "default"
+        // Uses merkle_root in JSON to test serde alias backward compat
         let json = r#"{
             "object_id": "test",
             "version": 1,

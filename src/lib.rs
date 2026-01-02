@@ -137,4 +137,4 @@ pub use resilience::wal::{WriteAheadLog, MysqlHealthChecker, WalStats};
 pub use resilience::circuit_breaker::{CircuitBreaker, CircuitConfig, CircuitError, BackendCircuits};
 pub use resilience::retry::RetryConfig;
 pub use metrics::LatencyTimer;
-pub use cdc::{CdcEntry, CdcOp, CdcMeta, CdcFieldValue, maybe_compress, maybe_decompress, cdc_stream_key, CDC_STREAM_SUFFIX};
+pub use cdc::{CdcEntry, CdcOp, CdcMeta, CdcFieldValue, maybe_compress, maybe_decompress, is_zstd_compressed, cdc_stream_key, CDC_STREAM_SUFFIX};

@@ -428,7 +428,7 @@ impl SyncEngine {
             .map(|item| {
                 CdcEntry::put(
                     item.object_id.clone(),
-                    item.merkle_root.clone(),
+                    item.content_hash.clone(),
                     &item.content,
                     item.content_type.as_str(),
                     item.version,

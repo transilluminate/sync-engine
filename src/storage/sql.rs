@@ -289,7 +289,7 @@ impl ArchiveStore for SqlStore {
         let id = item.object_id.clone();
         let version = item.version as i64;
         let timestamp = item.updated_at;
-        let payload_hash = if item.merkle_root.is_empty() { None } else { Some(item.merkle_root.clone()) };
+        let payload_hash = if item.content_hash.is_empty() { None } else { Some(item.content_hash.clone()) };
         let audit_json = Self::build_audit_json(item);
         let state = item.state.clone();
         
@@ -519,7 +519,7 @@ impl SqlStore {
                     id: item.object_id.clone(),
                     version: item.version as i64,
                     timestamp: item.updated_at,
-                    payload_hash: if item.merkle_root.is_empty() { None } else { Some(item.merkle_root.clone()) },
+                    payload_hash: if item.content_hash.is_empty() { None } else { Some(item.content_hash.clone()) },
                     payload_json,
                     payload_blob,
                     audit_json: Self::build_audit_json(item),
