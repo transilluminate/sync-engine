@@ -73,7 +73,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sync-engine = "0.2.2"
+sync-engine = "0.2.3"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
@@ -291,7 +291,7 @@ Comprehensive test suite with 324 tests covering unit, property-based, integrati
 | **Property Tests** | 12 ✅ | Proptest fuzzing for invariants |
 | **Integration Tests** | 30 ✅ | Real Redis Stack/MySQL via testcontainers |
 | **Chaos Tests** | 10 ✅ | Failure injection, container killing |
-| **Total** | **324** ✅ | ~76.6% code coverage |
+| **Total** | **324** ✅ | ~76% code coverage |
 
 ### Running Tests
 

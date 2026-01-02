@@ -3,49 +3,48 @@
 ╚═══════════════════════════════════════════════════════════════╝
 
 📦 Configuring sync-engine...
-2026-01-02T13:49:05.439887Z  INFO Creating expandable cuckoo filter manager node_id=sync-engine-l3 initial_capacity=100000
+2026-01-02T23:48:14.416984Z  INFO Creating expandable cuckoo filter manager node_id=sync-engine-l3 initial_capacity=100000
    State: Created
 
 🚀 Starting engine (connecting to backends)...
-2026-01-02T13:49:05.442928Z  INFO start: Starting sync engine with trust-verified startup...
-2026-01-02T13:49:05.443308Z  INFO start: Initializing write-ahead log path=./sync_engine_wal.db max_items=1000000 max_bytes=104857600
-2026-01-02T13:49:05.451923Z  INFO start: Write-ahead log initialized path=./sync_engine_wal.db
-2026-01-02T13:49:05.452749Z  INFO start: Connecting to SQL (L3 - ground truth)... url=mysql://test:test@localhost:3306/test
-2026-01-02T13:49:05.573585Z  INFO start: SQL (L3) connected with merkle store (ground truth) has_sql=true
-2026-01-02T13:49:05.575362Z  INFO start: SQL merkle root (ground truth) root=cf9b6d08191ade9a77b9e2d0256a2ce928fe87b75cb231d8ebd43666d92c41cb has_sql=true
-2026-01-02T13:49:05.575780Z  INFO start: No L3 CF snapshot found - filter will be built on warmup has_sql=true
-2026-01-02T13:49:05.575876Z  INFO start: Connecting to Redis (L2 - cache)... url=redis://localhost:6379 prefix=Some("sync:") has_sql=true
-2026-01-02T13:49:05.578410Z  INFO start: Redis (L2) connected with merkle shadow tree has_sql=true has_redis=true
-2026-01-02T13:49:05.579726Z  INFO start: Redis merkle tree is empty - will be populated on writes has_sql=true has_redis=true
-2026-01-02T13:49:05.579813Z  INFO start: Sync engine ready (trust-verified startup complete) has_sql=true has_redis=true
+2026-01-02T23:48:14.420973Z  INFO start: Starting sync engine with trust-verified startup...
+2026-01-02T23:48:14.421484Z  INFO start: Initializing write-ahead log path=./sync_engine_wal.db max_items=1000000 max_bytes=104857600
+2026-01-02T23:48:14.429596Z  INFO start: Write-ahead log initialized path=./sync_engine_wal.db
+2026-01-02T23:48:14.430587Z  INFO start: Connecting to SQL (L3 - ground truth)... url=mysql://test:test@localhost:3306/test
+2026-01-02T23:48:14.558800Z  INFO start: SQL (L3) connected with merkle store (ground truth) has_sql=true
+2026-01-02T23:48:14.563375Z  INFO start: SQL merkle tree is empty (no data yet) has_sql=true
+2026-01-02T23:48:14.563467Z  INFO start: Connecting to Redis (L2 - cache)... url=redis://localhost:6379 prefix=Some("sync:") has_sql=true
+2026-01-02T23:48:14.566054Z  INFO start: Redis (L2) connected with merkle shadow tree has_sql=true has_redis=true
+2026-01-02T23:48:14.566095Z  INFO start: Sync engine ready (trust-verified startup complete) has_sql=true has_redis=true
    ✅ Engine ready! State: Ready
 
 📝 Creating 5 sample entries...
    ⏱️  Timing each .await() to showcase L1 cache speed
-   └─ Submitted: user.alice → {"name":"Alice","role":"admin"} (160.041µs)
-   └─ Submitted: user.bob → {"name":"Bob","role":"user"} (81.917µs)
-   └─ Submitted: user.carol → {"name":"Carol","role":"user"} (60.125µs)
-   └─ Submitted: config.app → {"theme":"dark","version":"2.0"} (62.917µs)
-   └─ Submitted: stats.daily → {"latency_p99":12,"requests":42000} (58.875µs)
-   ⚡ Submit avg: 84.775µs (L1 memory write, non-blocking)
+   └─ Submitted: user.alice → {"name":"Alice","role":"admin"} (114.958µs)
+   └─ Submitted: user.bob → {"name":"Bob","role":"user"} (51.583µs)
+   └─ Submitted: user.carol → {"name":"Carol","role":"user"} (44.292µs)
+   └─ Submitted: config.app → {"theme":"dark","version":"2.0"} (42.875µs)
+   └─ Submitted: stats.daily → {"latency_p99":12,"requests":42000} (43.417µs)
+   ⚡ Submit avg: 59.425µs (L1 memory write, non-blocking)
 
 ⏳ Flushing to backends... (waiting 100ms for async writes)
-2026-01-02T13:49:05.627280Z  INFO Batch flush complete l2_success=5 l2_errors=0 l3_success=5 wal_fallback=0 groups=1 flush_ms=46 reason=Manual
+2026-01-02T23:48:14.623630Z  INFO Batch flush complete l2_success=5 l2_errors=0 l3_success=5 wal_fallback=0 groups=1 flush_ms=56 reason=Manual
    ✅ Flush complete!
 
 🔍 Checking existence...
-   └─ contains_fast('user.alice'): true
+   └─ definitely_missing('user.alice'): false
+   └─ might_exist('user.alice'): true
    └─ contains('user.alice'): true
    └─ contains('user.nobody'): false
 
 📖 Fetching entries back (with timing)...
    ⏱️  These should hit L1 cache (microseconds!)
-   └─ user.alice (v1) → {"name":"Alice","role":"admin"} (248.292µs)
-   └─ user.bob (v1) → {"name":"Bob","role":"user"} (73.541µs)
-   └─ user.carol (v1) → {"name":"Carol","role":"user"} (50µs)
-   └─ config.app (v1) → {"theme":"dark","version":"2.0"} (45.834µs)
-   └─ stats.daily (v1) → {"latency_p99":12,"requests":42000} (48.125µs)
-   ⚡ Get avg: 93.158µs (L1 cache hit)
+   └─ user.alice (v1) → {"name":"Alice","role":"admin"} (169.75µs)
+   └─ user.bob (v1) → {"name":"Bob","role":"user"} (66.167µs)
+   └─ user.carol (v1) → {"name":"Carol","role":"user"} (41.417µs)
+   └─ config.app (v1) → {"theme":"dark","version":"2.0"} (39.25µs)
+   └─ stats.daily (v1) → {"latency_p99":12,"requests":42000} (38.083µs)
+   ⚡ Get avg: 70.933µs (L1 cache hit)
 
 📊 Engine Metrics:
    ┌─ L1 Cache (Memory)
@@ -56,13 +55,13 @@
    │  └─ Entries: 5/100000
    │  └─ Trust: Untrusted
    ├─ Merkle Trees
-   │  └─ Redis (L2): e7df34b5708e4d9072e0ba58988fe8f15f91ea44aac74928253462db61567efe
-   │  └─ SQL (L3):   e7df34b5708e4d9072e0ba58988fe8f15f91ea44aac74928253462db61567efe
+   │  └─ Redis (L2): 09ea1b40b8258d774a5c777ddc2e9894be7f3b70732eca0bb437efdcb76d536c
+   │  └─ SQL (L3):   09ea1b40b8258d774a5c777ddc2e9894be7f3b70732eca0bb437efdcb76d536c
    │  └─ ✅ Roots match! Data is in sync.
 
 🔐 Verifying L3 filter against SQL merkle...
-2026-01-02T13:49:05.754982Z  INFO Verifying L3 filter against SQL merkle root sql_root=e7df34b5708e4d9072e0ba58988fe8f15f91ea44aac74928253462db61567efe
-2026-01-02T13:49:05.755031Z  INFO Marking cuckoo filter as trusted entries=5
+2026-01-02T23:48:14.751585Z  INFO Verifying L3 filter against SQL merkle root sql_root=09ea1b40b8258d774a5c777ddc2e9894be7f3b70732eca0bb437efdcb76d536c
+2026-01-02T23:48:14.751645Z  INFO Marking cuckoo filter as trusted entries=5
    └─ Verified: true → Trust: Trusted
 
 📍 Item Status:
@@ -104,35 +103,33 @@
    │  └─ sync_engine_batch_size{tier=L3}
    │     count=1 sum=5.0000 avg=5.0000 min=5.0000 max=5.0000
    │  └─ sync_engine_flush_seconds
-   │     count=1 sum=0.0464 avg=0.0464 min=0.0464 max=0.0464
+   │     count=1 sum=0.0568 avg=0.0568 min=0.0568 max=0.0568
    │  └─ sync_engine_operation_seconds{tier=L1,operation=submit}
-   │     count=5 sum=0.0002 avg=0.0000 min=0.0000 max=0.0001
+   │     count=5 sum=0.0001 avg=0.0000 min=0.0000 max=0.0001
    │  └─ sync_engine_operation_seconds{tier=L2,operation=batch_write}
-   │     count=1 sum=0.0013 avg=0.0013 min=0.0013 max=0.0013
+   │     count=1 sum=0.0008 avg=0.0008 min=0.0008 max=0.0008
    │  └─ sync_engine_operation_seconds{tier=CDC,operation=put_batch}
-   │     count=1 sum=0.0006 avg=0.0006 min=0.0006 max=0.0006
+   │     count=1 sum=0.0005 avg=0.0005 min=0.0005 max=0.0005
    │  └─ sync_engine_operation_seconds{tier=L3,operation=batch_write}
-   │     count=1 sum=0.0101 avg=0.0101 min=0.0101 max=0.0101
+   │     count=1 sum=0.0127 avg=0.0127 min=0.0127 max=0.0127
    │  └─ sync_engine_operation_seconds{tier=L1,operation=get}
    │     count=5 sum=0.0002 avg=0.0000 min=0.0000 max=0.0001
    │  └─ sync_engine_startup_seconds{phase=wal_init}
-   │     count=1 sum=0.0089 avg=0.0089 min=0.0089 max=0.0089
+   │     count=1 sum=0.0085 avg=0.0085 min=0.0085 max=0.0085
    │  └─ sync_engine_startup_seconds{phase=sql_connect}
-   │     count=1 sum=0.1208 avg=0.1208 min=0.1208 max=0.1208
+   │     count=1 sum=0.1282 avg=0.1282 min=0.1282 max=0.1282
    │  └─ sync_engine_startup_seconds{phase=cf_restore}
-   │     count=1 sum=0.0004 avg=0.0004 min=0.0004 max=0.0004
+   │     count=1 sum=0.0000 avg=0.0000 min=0.0000 max=0.0000
    │  └─ sync_engine_startup_seconds{phase=redis_connect}
-   │     count=1 sum=0.0025 avg=0.0025 min=0.0025 max=0.0025
-   │  └─ sync_engine_startup_seconds{phase=redis_sync}
-   │     count=1 sum=0.0013 avg=0.0013 min=0.0013 max=0.0013
+   │     count=1 sum=0.0026 avg=0.0026 min=0.0026 max=0.0026
    │  └─ sync_engine_startup_total_seconds
-   │     count=1 sum=0.1369 avg=0.1369 min=0.1369 max=0.1369
+   │     count=1 sum=0.1451 avg=0.1451 min=0.1451 max=0.1451
 
 🛑 Shutting down...
-2026-01-02T13:49:05.764235Z  INFO shutdown: Initiating sync engine shutdown...
-2026-01-02T13:49:05.791488Z  INFO shutdown: Filter state saved filter_id="l3" entry_count=5 bytes=131108
-2026-01-02T13:49:05.791527Z  INFO shutdown: Cuckoo filter snapshot saved (L3 only) reason="shutdown" inserts_since_last=5 l3_entries=5 merkle_root=e7df34b5708e4d9072e0ba58988fe8f15f91ea44aac74928253462db61567efe
-2026-01-02T13:49:05.791566Z  INFO shutdown: Sync engine shutdown complete
+2026-01-02T23:48:14.760334Z  INFO shutdown: Initiating sync engine shutdown...
+2026-01-02T23:48:14.783784Z  INFO shutdown: Filter state saved filter_id="l3" entry_count=5 bytes=131108
+2026-01-02T23:48:14.783839Z  INFO shutdown: Cuckoo filter snapshot saved (L3 only) reason="shutdown" inserts_since_last=5 l3_entries=5 merkle_root=09ea1b40b8258d774a5c777ddc2e9894be7f3b70732eca0bb437efdcb76d536c
+2026-01-02T23:48:14.783892Z  INFO shutdown: Sync engine shutdown complete
    ✅ Shutdown complete! State: ShuttingDown
 
 🧹 Cleaning up WAL file...

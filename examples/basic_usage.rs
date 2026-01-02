@@ -116,9 +116,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ─────────────────────────────────────────────────────────────────────────
     println!("\n🔍 Checking existence...");
     
-    // Fast sync check (L1 + Cuckoo filter only)
-    let fast_check = engine.contains_fast("user.alice");
-    println!("   └─ contains_fast('user.alice'): {}", fast_check);
+    // Fast check: definitely missing? (authoritative negative from Cuckoo)
+    let def_missing = engine.definitely_missing("user.alice");
+    println!("   └─ definitely_missing('user.alice'): {}", def_missing);
+    
+    // Fast check: might exist? (L1 + Cuckoo probabilistic)
+    let might = engine.might_exist("user.alice");
+    println!("   └─ might_exist('user.alice'): {}", might);
     
     // Authoritative check (L1 → L2 → L3)
     let exists = engine.contains("user.alice").await;

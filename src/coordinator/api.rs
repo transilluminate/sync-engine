@@ -80,13 +80,59 @@ impl SyncEngine {
         false
     }
     
-    /// Fast sync check if item might exist (L1 + Cuckoo only).
+    /// Fast check: is this item definitely NOT in L3?
     ///
-    /// Use this when you need a quick probabilistic check without async.
-    /// For authoritative check, use `contains()` instead.
+    /// Uses the Cuckoo filter for a fast authoritative negative.
+    /// - Returns `true` → item is **definitely not** in L3 (safe to skip)
+    /// - Returns `false` → item **might** exist (need to check L3)
+    ///
+    /// Only meaningful when the L3 filter is trusted. If untrusted, returns `false`
+    /// (meaning "we don't know, you should check").
+    ///
+    /// # Use Case
+    ///
+    /// Fast early-exit in replication: if definitely missing, apply without checking.
+    ///
+    /// ```rust,no_run
+    /// # use sync_engine::SyncEngine;
+    /// # async fn example(engine: &SyncEngine) {
+    /// if engine.definitely_missing("patient.123") {
+    ///     // Fast path: definitely new, just insert
+    ///     println!("New item, inserting directly");
+    /// } else {
+    ///     // Slow path: might exist, check hash
+    ///     if !engine.is_current("patient.123", "abc123...").await {
+    ///         println!("Outdated, updating");
+    ///     }
+    /// }
+    /// # }
+    /// ```
     #[must_use]
     #[inline]
-    pub fn contains_fast(&self, id: &str) -> bool {
+    pub fn definitely_missing(&self, id: &str) -> bool {
+        // Only authoritative if filter is trusted
+        if !self.l3_filter.is_trusted() {
+            return false; // Unknown, caller should check
+        }
+        // Cuckoo false = definitely not there
+        !self.l3_filter.should_check_l3(id)
+    }
+
+    /// Fast check: might this item exist somewhere?
+    ///
+    /// Checks L1 cache (partial, evicts) and Cuckoo filter (probabilistic).
+    /// - Returns `true` → item is in L1 OR might be in L3 (worth checking)
+    /// - Returns `false` → item is definitely not in L1 or L3
+    ///
+    /// Note: L1 is partial (items evict), so this can return `false` even if
+    /// the item exists in L2/L3. For authoritative check, use `contains()`.
+    ///
+    /// # Use Case
+    ///
+    /// Quick probabilistic check before expensive async lookup.
+    #[must_use]
+    #[inline]
+    pub fn might_exist(&self, id: &str) -> bool {
         self.l1_cache.contains_key(id) || self.l3_filter.should_check_l3(id)
     }
 
