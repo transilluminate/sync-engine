@@ -102,7 +102,7 @@ impl Query {
     }
 
     /// Negate query
-    pub fn not(self) -> Self {
+    pub fn negate(self) -> Self {
         Self::new(QueryNode::Not(Box::new(self.root)))
     }
 }
@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn test_not_query() {
-        let query = Query::field_eq("deleted", "true").not();
+        let query = Query::field_eq("deleted", "true").negate();
 
         match query.root {
             QueryNode::Not(_) => {}

@@ -23,6 +23,7 @@
 
 use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
+use sha2::{Sha256, Digest};
 use crate::batching::hybrid_batcher::{SizedItem, BatchableItem};
 use crate::submit_options::SubmitOptions;
 
@@ -83,6 +84,16 @@ impl ContentType {
     pub fn is_binary(&self) -> bool {
         matches!(self, ContentType::Binary)
     }
+    
+    /// Return the string representation for serialization
+    #[inline]
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ContentType::Json => "json",
+            ContentType::Binary => "binary",
+        }
+    }
 }
 
 /// A wrapper struct that separates metadata from content.
@@ -132,7 +143,9 @@ pub struct SyncItem {
     /// Reserved for future use. Currently unused.
     #[doc(hidden)]
     pub priority_score: f64,
-    /// Hash of the content for quick integrity checks
+    /// SHA256 hash of the content (hex-encoded).
+    /// Computed eagerly on creation for CDC dedup and integrity checks.
+    /// Named `merkle_root` for historical reasons but is really a content hash.
     pub merkle_root: String,
     /// Timestamp of last access (epoch millis)
     pub last_accessed: u64,
@@ -187,6 +200,8 @@ impl SyncItem {
     /// ```
     pub fn new(object_id: String, content: Vec<u8>) -> Self {
         let content_type = ContentType::detect(&content);
+        // Compute content hash eagerly for CDC dedup
+        let merkle_root = hex::encode(Sha256::digest(&content));
         Self {
             object_id,
             version: 1,
@@ -199,7 +214,7 @@ impl SyncItem {
             trace_parent: None,
             trace_state: None,
             priority_score: 0.0,
-            merkle_root: String::new(),
+            merkle_root,
             last_accessed: 0,
             access_count: 0,
             content,
@@ -381,7 +396,9 @@ mod tests {
         assert!(item.trace_parent.is_none());
         assert!(item.trace_state.is_none());
         assert_eq!(item.priority_score, 0.0);
-        assert!(item.merkle_root.is_empty());
+        // Content hash is computed eagerly for CDC dedup
+        // SHA256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+        assert_eq!(item.merkle_root, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
         assert_eq!(item.last_accessed, 0);
         assert_eq!(item.access_count, 0);
         assert!(item.home_instance_id.is_none());

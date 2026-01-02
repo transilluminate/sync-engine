@@ -68,20 +68,12 @@ pub enum SearchSource {
 }
 
 /// Search-related state for SyncEngine
+#[derive(Default)]
 pub struct SearchState {
     /// Index manager
     pub index_manager: IndexManager,
     /// Search result cache
     pub cache: SearchCache,
-}
-
-impl Default for SearchState {
-    fn default() -> Self {
-        Self {
-            index_manager: IndexManager::new(),
-            cache: SearchCache::default(),
-        }
-    }
 }
 
 impl SyncEngine {

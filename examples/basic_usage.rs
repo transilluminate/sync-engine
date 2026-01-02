@@ -60,6 +60,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Batch settings (flush quickly for demo)
         batch_flush_count: 10,
         batch_flush_ms: 500,
+        // CDC stream for replication
+        enable_cdc_stream: true,
+        cdc_stream_maxlen: 10_000,
         ..Default::default()
     };
 

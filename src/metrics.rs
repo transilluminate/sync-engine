@@ -331,6 +331,19 @@ pub fn record_merkle_operation(store: &str, operation: &str, success: bool) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// CDC STREAM - Change Data Capture metrics
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Record CDC entries emitted to stream
+pub fn record_cdc_entries(op: &str, count: usize) {
+    counter!(
+        "sync_engine_cdc_entries_total",
+        "op" => op.to_string()
+    )
+    .increment(count as u64);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // SEARCH - RediSearch and SQL search metrics
 // ═══════════════════════════════════════════════════════════════════════════
 

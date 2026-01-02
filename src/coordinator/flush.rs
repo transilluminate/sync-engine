@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{info, warn, debug, error};
 
+use crate::cdc::CdcEntry;
 use crate::storage::traits::StorageError;
 use crate::sync_item::SyncItem;
 use crate::submit_options::OptionsKey;
@@ -184,6 +185,11 @@ impl SyncEngine {
                             crate::metrics::record_latency("L2", "batch_write", l2_start.elapsed());
                             // Note: No L2 filter - TTL makes filters untrustworthy
                             debug!(written = result.written, ttl = ?ttl_secs, "L2 group write complete");
+                            
+                            // ====== CDC: Emit PUT entries after successful L2 write ======
+                            if self.config.enable_cdc_stream {
+                                self.emit_cdc_put_batch(&items).await;
+                            }
                         }
                         Err(e) => {
                             warn!(error = %e, group_size, "L2 group write failed");
@@ -400,5 +406,72 @@ impl SyncEngine {
         }
         
         Err(StorageError::Backend("No L3 or WAL available".to_string()))
+    }
+    
+    // ========================================================================
+    // CDC Stream Helpers
+    // ========================================================================
+    
+    /// Emit CDC PUT entries for a batch of items.
+    /// 
+    /// Called after successful L2 write. Uses pipelining for efficiency.
+    /// Failures are logged but don't block the main write path.
+    pub(super) async fn emit_cdc_put_batch(&self, items: &[SyncItem]) {
+        let Some(ref redis) = self.redis_store else { return };
+        
+        if items.is_empty() {
+            return;
+        }
+        
+        // Build CDC entries
+        let entries: Vec<CdcEntry> = items.iter()
+            .map(|item| {
+                CdcEntry::put(
+                    item.object_id.clone(),
+                    item.merkle_root.clone(),
+                    &item.content,
+                    item.content_type.as_str(),
+                    item.version,
+                    item.updated_at,
+                    item.trace_parent.clone(),
+                )
+            })
+            .collect();
+        
+        let cdc_start = std::time::Instant::now();
+        match redis.xadd_cdc_batch(&entries, self.config.cdc_stream_maxlen).await {
+            Ok(ids) => {
+                debug!(count = ids.len(), "CDC PUT entries emitted");
+                crate::metrics::record_cdc_entries("PUT", ids.len());
+                crate::metrics::record_latency("CDC", "put_batch", cdc_start.elapsed());
+            }
+            Err(e) => {
+                // Log but don't fail - CDC is best-effort, merkle repair catches gaps
+                warn!(error = %e, count = items.len(), "Failed to emit CDC entries");
+                crate::metrics::record_error("CDC", "put", "backend");
+            }
+        }
+    }
+    
+    /// Emit a CDC DELETE entry for a single item.
+    /// 
+    /// Called after successful delete. Best-effort, doesn't block delete.
+    pub(super) async fn emit_cdc_delete(&self, id: &str) {
+        let Some(ref redis) = self.redis_store else { return };
+        
+        let entry = CdcEntry::delete(id.to_string());
+        
+        let cdc_start = std::time::Instant::now();
+        match redis.xadd_cdc(&entry, self.config.cdc_stream_maxlen).await {
+            Ok(_entry_id) => {
+                debug!(id = %id, "CDC DEL entry emitted");
+                crate::metrics::record_cdc_entries("DEL", 1);
+                crate::metrics::record_latency("CDC", "delete", cdc_start.elapsed());
+            }
+            Err(e) => {
+                warn!(error = %e, id = %id, "Failed to emit CDC delete entry");
+                crate::metrics::record_error("CDC", "delete", "backend");
+            }
+        }
     }
 }

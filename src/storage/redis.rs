@@ -817,4 +817,87 @@ impl RedisStore {
         
         Ok(deleted)
     }
+    
+    // ========================================================================
+    // CDC Stream Methods
+    // ========================================================================
+    
+    /// Write a CDC entry to the stream.
+    /// 
+    /// Uses XADD with MAXLEN ~ for bounded stream size.
+    /// The stream key is `{prefix}__local__:cdc`.
+    pub async fn xadd_cdc(
+        &self, 
+        entry: &crate::cdc::CdcEntry, 
+        maxlen: u64
+    ) -> Result<String, StorageError> {
+        let stream_key = crate::cdc::cdc_stream_key(if self.prefix.is_empty() { None } else { Some(&self.prefix) });
+        let fields = entry.to_redis_fields();
+        
+        let mut conn = self.connection.clone();
+        
+        // Build XADD command: XADD key MAXLEN ~ maxlen * field1 value1 field2 value2 ...
+        let mut command = cmd("XADD");
+        command.arg(&stream_key);
+        command.arg("MAXLEN");
+        command.arg("~");
+        command.arg(maxlen);
+        command.arg("*"); // Auto-generate ID
+        
+        for (field, value) in fields {
+            command.arg(field);
+            command.arg(value.as_bytes());
+        }
+        
+        let entry_id: String = command
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| StorageError::Backend(format!("XADD CDC failed: {}", e)))?;
+        
+        Ok(entry_id)
+    }
+    
+    /// Write multiple CDC entries to the stream in a pipeline.
+    /// 
+    /// Returns the stream entry IDs for each write.
+    pub async fn xadd_cdc_batch(
+        &self, 
+        entries: &[crate::cdc::CdcEntry], 
+        maxlen: u64
+    ) -> Result<Vec<String>, StorageError> {
+        if entries.is_empty() {
+            return Ok(vec![]);
+        }
+        
+        let stream_key = crate::cdc::cdc_stream_key(if self.prefix.is_empty() { None } else { Some(&self.prefix) });
+        let mut conn = self.connection.clone();
+        
+        let mut pipeline = pipe();
+        
+        for entry in entries {
+            let fields = entry.to_redis_fields();
+            
+            // Start XADD command in pipeline
+            let mut command = cmd("XADD");
+            command.arg(&stream_key);
+            command.arg("MAXLEN");
+            command.arg("~");
+            command.arg(maxlen);
+            command.arg("*");
+            
+            for (field, value) in fields {
+                command.arg(field);
+                command.arg(value.as_bytes());
+            }
+            
+            pipeline.add_command(command);
+        }
+        
+        let ids: Vec<String> = pipeline
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| StorageError::Backend(format!("XADD CDC batch failed: {}", e)))?;
+        
+        Ok(ids)
+    }
 }

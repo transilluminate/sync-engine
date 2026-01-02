@@ -102,6 +102,9 @@ pub struct SyncEngine {
 
     /// L2: Redis cache (optional)
     pub(super) l2_store: Option<Arc<dyn CacheStore>>,
+    
+    /// L2: Direct RedisStore reference for CDC operations
+    pub(super) redis_store: Option<Arc<crate::storage::redis::RedisStore>>,
 
     /// L3: MySQL/SQLite archive (optional)
     pub(super) l3_store: Option<Arc<dyn ArchiveStore>>,
@@ -163,6 +166,7 @@ impl SyncEngine {
             l1_cache: Arc::new(DashMap::new()),
             l1_size_bytes: Arc::new(AtomicUsize::new(0)),
             l2_store: None,
+            redis_store: None,
             l3_store: None,
             sql_store: None,
             l3_filter: Arc::new(FilterManager::new("sync-engine-l3", 100_000)),
@@ -519,6 +523,11 @@ impl SyncEngine {
                 warn!(error = %e, "Failed to update Redis Merkle tree for deletion");
                 crate::metrics::record_error("L2", "merkle", "batch_apply");
             }
+        }
+
+        // 6. Emit CDC delete entry (if enabled)
+        if self.config.enable_cdc_stream && found {
+            self.emit_cdc_delete(id).await;
         }
 
         info!(found, "Delete operation completed");

@@ -120,6 +120,7 @@ pub mod backpressure;
 pub mod coordinator;
 pub mod metrics;
 pub mod search;
+pub mod cdc;
 
 // Note: We don't expose a `tracing` module to avoid conflict with the tracing crate
 
@@ -136,3 +137,4 @@ pub use resilience::wal::{WriteAheadLog, MysqlHealthChecker, WalStats};
 pub use resilience::circuit_breaker::{CircuitBreaker, CircuitConfig, CircuitError, BackendCircuits};
 pub use resilience::retry::RetryConfig;
 pub use metrics::LatencyTimer;
+pub use cdc::{CdcEntry, CdcOp, CdcMeta, CdcFieldValue, maybe_compress, maybe_decompress, cdc_stream_key, CDC_STREAM_SUFFIX};

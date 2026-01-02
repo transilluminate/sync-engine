@@ -1692,3 +1692,264 @@ async fn happy_search_cache_invalidation() {
     engine.shutdown().await;
     cleanup_wal_files(&wal_path);
 }
+
+// =============================================================================
+// CDC Stream Tests
+// =============================================================================
+
+#[tokio::test]
+#[ignore] // Requires Docker
+async fn cdc_stream_put_entries() {
+    // Test that PUT operations emit CDC entries to the Redis stream
+    let docker = Cli::default();
+    let redis = redis_container(&docker);
+    let redis_port = redis.get_host_port_ipv4(6379);
+    
+    let wal_path = unique_wal_path("cdc_put");
+    let config = SyncEngineConfig {
+        redis_url: Some(format!("redis://127.0.0.1:{}", redis_port)),
+        sql_url: None,
+        l1_max_bytes: 10 * 1024 * 1024,
+        wal_path: Some(wal_path.clone()),
+        enable_cdc_stream: true,  // Enable CDC
+        cdc_stream_maxlen: 1000,
+        ..Default::default()
+    };
+
+    let (_tx, rx) = watch::channel(config.clone());
+    let mut engine = SyncEngine::new(config, rx);
+    engine.start().await.expect("Failed to start engine");
+
+    // Submit items
+    let item1 = SyncItem::from_json("cdc.test.1".to_string(), json!({"name": "Alice"}));
+    let item2 = SyncItem::from_json("cdc.test.2".to_string(), json!({"name": "Bob"}));
+    
+    engine.submit(item1).await.expect("Submit failed");
+    engine.submit(item2).await.expect("Submit failed");
+    
+    // Force flush to ensure items are written to Redis and CDC emitted
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    engine.force_flush().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Read CDC stream directly from Redis
+    let client = redis::Client::open(format!("redis://127.0.0.1:{}", redis_port)).unwrap();
+    let mut conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+    
+    // XRANGE __local__:cdc - + COUNT 10
+    let entries: Vec<redis::Value> = redis::cmd("XRANGE")
+        .arg("__local__:cdc")
+        .arg("-")
+        .arg("+")
+        .arg("COUNT")
+        .arg(10)
+        .query_async(&mut conn)
+        .await
+        .expect("XRANGE failed");
+    
+    assert_eq!(entries.len(), 2, "Should have 2 CDC entries");
+    
+    // Parse first entry and verify fields
+    if let redis::Value::Array(entry) = &entries[0] {
+        // entry = [id, [field, value, field, value, ...]]
+        if let redis::Value::Array(fields) = &entry[1] {
+            // Find "op" field
+            let mut op_found = false;
+            let mut key_found = false;
+            for i in (0..fields.len()).step_by(2) {
+                if let (redis::Value::BulkString(field), redis::Value::BulkString(value)) = (&fields[i], &fields[i+1]) {
+                    let field_str = String::from_utf8_lossy(field);
+                    let value_str = String::from_utf8_lossy(value);
+                    if field_str == "op" {
+                        assert_eq!(value_str, "PUT");
+                        op_found = true;
+                    }
+                    if field_str == "key" {
+                        assert_eq!(value_str, "cdc.test.1");
+                        key_found = true;
+                    }
+                }
+            }
+            assert!(op_found, "CDC entry should have 'op' field");
+            assert!(key_found, "CDC entry should have 'key' field");
+        }
+    }
+
+    engine.shutdown().await;
+    cleanup_wal_files(&wal_path);
+}
+
+#[tokio::test]
+#[ignore] // Requires Docker
+async fn cdc_stream_delete_entries() {
+    // Test that DELETE operations emit CDC entries to the Redis stream
+    let docker = Cli::default();
+    let redis = redis_container(&docker);
+    let redis_port = redis.get_host_port_ipv4(6379);
+    
+    let wal_path = unique_wal_path("cdc_del");
+    let config = SyncEngineConfig {
+        redis_url: Some(format!("redis://127.0.0.1:{}", redis_port)),
+        sql_url: None,  // No SQL needed for this test
+        l1_max_bytes: 10 * 1024 * 1024,
+        wal_path: Some(wal_path.clone()),
+        enable_cdc_stream: true,
+        cdc_stream_maxlen: 1000,
+        ..Default::default()
+    };
+
+    let (_tx, rx) = watch::channel(config.clone());
+    let mut engine = SyncEngine::new(config, rx);
+    engine.start().await.expect("Failed to start engine");
+
+    // Create an item first
+    let item = SyncItem::from_json("cdc.delete.test".to_string(), json!({"name": "ToDelete"}));
+    engine.submit(item).await.expect("Submit failed");
+    
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    engine.force_flush().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Delete the item
+    let deleted = engine.delete("cdc.delete.test").await.expect("Delete failed");
+    assert!(deleted, "Item should have been deleted");
+
+    // Read CDC stream
+    let client = redis::Client::open(format!("redis://127.0.0.1:{}", redis_port)).unwrap();
+    let mut conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+    
+    let entries: Vec<redis::Value> = redis::cmd("XRANGE")
+        .arg("__local__:cdc")
+        .arg("-")
+        .arg("+")
+        .arg("COUNT")
+        .arg(10)
+        .query_async(&mut conn)
+        .await
+        .expect("XRANGE failed");
+    
+    // Should have PUT + DEL entries
+    assert!(entries.len() >= 2, "Should have at least PUT and DEL entries");
+    
+    // Find DEL entry
+    let mut found_del = false;
+    for entry_val in &entries {
+        if let redis::Value::Array(entry) = entry_val {
+            if let redis::Value::Array(fields) = &entry[1] {
+                for i in (0..fields.len()).step_by(2) {
+                    if let (redis::Value::BulkString(field), redis::Value::BulkString(value)) = (&fields[i], &fields[i+1]) {
+                        if String::from_utf8_lossy(field) == "op" && String::from_utf8_lossy(value) == "DEL" {
+                            found_del = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(found_del, "Should have DEL entry in CDC stream");
+
+    engine.shutdown().await;
+    cleanup_wal_files(&wal_path);
+}
+
+#[tokio::test]
+#[ignore] // Requires Docker
+async fn cdc_stream_disabled_no_entries() {
+    // Test that CDC entries are NOT emitted when feature is disabled
+    let docker = Cli::default();
+    let redis = redis_container(&docker);
+    let redis_port = redis.get_host_port_ipv4(6379);
+    
+    let wal_path = unique_wal_path("cdc_disabled");
+    let config = SyncEngineConfig {
+        redis_url: Some(format!("redis://127.0.0.1:{}", redis_port)),
+        sql_url: None,
+        l1_max_bytes: 10 * 1024 * 1024,
+        wal_path: Some(wal_path.clone()),
+        enable_cdc_stream: false,  // CDC disabled
+        ..Default::default()
+    };
+
+    let (_tx, rx) = watch::channel(config.clone());
+    let mut engine = SyncEngine::new(config, rx);
+    engine.start().await.expect("Failed to start engine");
+
+    // Submit items
+    let item = SyncItem::from_json("cdc.disabled.test".to_string(), json!({"name": "NoStream"}));
+    engine.submit(item).await.expect("Submit failed");
+    
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    engine.force_flush().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // CDC stream should NOT exist
+    let client = redis::Client::open(format!("redis://127.0.0.1:{}", redis_port)).unwrap();
+    let mut conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+    
+    let exists: bool = redis::cmd("EXISTS")
+        .arg("__local__:cdc")
+        .query_async(&mut conn)
+        .await
+        .expect("EXISTS failed");
+    
+    assert!(!exists, "CDC stream should not exist when disabled");
+
+    engine.shutdown().await;
+    cleanup_wal_files(&wal_path);
+}
+
+#[tokio::test]
+#[ignore] // Requires Docker
+async fn cdc_stream_respects_prefix() {
+    // Test that CDC stream key respects redis_prefix
+    let docker = Cli::default();
+    let redis = redis_container(&docker);
+    let redis_port = redis.get_host_port_ipv4(6379);
+    
+    let wal_path = unique_wal_path("cdc_prefix");
+    let config = SyncEngineConfig {
+        redis_url: Some(format!("redis://127.0.0.1:{}", redis_port)),
+        redis_prefix: Some("myapp:".to_string()),
+        sql_url: None,
+        l1_max_bytes: 10 * 1024 * 1024,
+        wal_path: Some(wal_path.clone()),
+        enable_cdc_stream: true,
+        cdc_stream_maxlen: 1000,
+        ..Default::default()
+    };
+
+    let (_tx, rx) = watch::channel(config.clone());
+    let mut engine = SyncEngine::new(config, rx);
+    engine.start().await.expect("Failed to start engine");
+
+    // Submit item
+    let item = SyncItem::from_json("cdc.prefix.test".to_string(), json!({"name": "Prefixed"}));
+    engine.submit(item).await.expect("Submit failed");
+    
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    engine.force_flush().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // CDC stream should be at myapp:__local__:cdc
+    let client = redis::Client::open(format!("redis://127.0.0.1:{}", redis_port)).unwrap();
+    let mut conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+    
+    // Prefixed stream should exist
+    let prefixed_exists: bool = redis::cmd("EXISTS")
+        .arg("myapp:__local__:cdc")
+        .query_async(&mut conn)
+        .await
+        .expect("EXISTS failed");
+    assert!(prefixed_exists, "Prefixed CDC stream should exist");
+    
+    // Unprefixed stream should NOT exist
+    let unprefixed_exists: bool = redis::cmd("EXISTS")
+        .arg("__local__:cdc")
+        .query_async(&mut conn)
+        .await
+        .expect("EXISTS failed");
+    assert!(!unprefixed_exists, "Unprefixed CDC stream should not exist");
+
+    engine.shutdown().await;
+    cleanup_wal_files(&wal_path);
+}

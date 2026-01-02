@@ -65,6 +65,7 @@ optimizes storage for queryability while maintaining the original data integrity
 - **WAL Durability**: Local SQLite WAL during MySQL outages
 - **Backpressure**: Graceful degradation under memory pressure
 - **Circuit Breakers**: Prevent cascade failures to backends
+- **Change Detection Capture**: (CDC) stream output into Redis streams for replication
 
 ## Quick Start
 
@@ -72,7 +73,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sync-engine = "0.2"
+sync-engine = "0.2.1"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
@@ -237,35 +238,60 @@ let redis_only = engine.search_with_options("users", &query, SearchTier::RedisOn
 - **Text fields**: Full-text search with phrase matching
 - **Numeric fields**: Range queries with optional sorting
 - **Tag fields**: Exact multi-value matching with OR semantics
-- **Compound queries**: `.and()`, `.or()`, `.not()` for complex filters
+- **Compound queries**: `.and()`, `.or()`, `.negate()` for complex filters
 - **Search cache**: Merkle-invalidated SQL result caching for hybrid queries
 
 ## Configuration
 
+All configuration options with their defaults:
+
 | Option | Default | Description |
 |--------|---------|-------------|
-| `redis_url` | None | Redis connection string |
-| `redis_prefix` | None | Key prefix for namespacing (e.g., "sync:") |
-| `sql_url` | None | MySQL/SQLite connection string |
-| `l1_max_bytes` | 256 MB | Maximum L1 cache size |
-| `max_payload_bytes` | 16 MB | Max single item size (prevents cache exhaustion) |
-| `batch_flush_ms` | 100 | Flush batch after N milliseconds |
-| `batch_flush_count` | 1000 | Flush batch after N items |
-| `batch_flush_bytes` | 1 MB | Flush batch after N bytes |
-| `wal_path` | None | SQLite WAL path for durability |
+| **Connection** |||
+| `redis_url` | `None` | Redis connection string (e.g., `"redis://localhost:6379"`) |
+| `redis_prefix` | `None` | Key prefix for namespacing (e.g., `"sync:"`) |
+| `sql_url` | `None` | MySQL/SQLite connection string |
+| **Memory & Limits** |||
+| `l1_max_bytes` | `256 MB` | Maximum L1 cache size |
+| `max_payload_bytes` | `16 MB` | Max single item size (prevents cache exhaustion) |
+| **Batching** |||
+| `batch_flush_ms` | `100` | Flush batch after N milliseconds |
+| `batch_flush_count` | `1000` | Flush batch after N items |
+| `batch_flush_bytes` | `1 MB` | Flush batch after N bytes |
+| **Backpressure** |||
+| `backpressure_warn` | `0.7` | Memory pressure warning threshold (0.0-1.0) |
+| `backpressure_critical` | `0.9` | Memory pressure critical threshold (0.0-1.0) |
+| **WAL (Write-Ahead Log)** |||
+| `wal_path` | `None` | SQLite WAL path for durability during outages |
+| `wal_max_items` | `None` | Max WAL items before backpressure |
+| `wal_drain_batch_size` | `100` | Items per WAL drain batch |
+| **Cuckoo Filter** |||
+| `cuckoo_warmup_batch_size` | `10000` | Batch size when warming filter from SQL |
+| `cf_snapshot_interval_secs` | `30` | Snapshot filter to WAL every N seconds |
+| `cf_snapshot_insert_threshold` | `10000` | Snapshot filter after N inserts |
+| **Redis Eviction** |||
+| `redis_eviction_enabled` | `true` | Enable proactive eviction before Redis LRU |
+| `redis_eviction_start` | `0.75` | Start evicting at this pressure (0.0-1.0) |
+| `redis_eviction_target` | `0.60` | Target pressure after eviction (0.0-1.0) |
+| **Merkle Tree** |||
+| `merkle_calc_enabled` | `true` | Enable merkle updates (if sharing a SQL instance, disable on most nodes in cluster) |
+| `merkle_calc_jitter_ms` | `0` | Random delay to reduce cluster contention |
+| **CDC Stream** |||
+| `enable_cdc_stream` | `false` | Enable Change Data Capture to Redis Stream |
+| `cdc_stream_maxlen` | `100000` | Max stream entries (MAXLEN ~, relies on Merkle repair) |
 
 ## Testing
 
-Comprehensive test suite with 251 tests covering unit, property-based, integration, and chaos testing:
+Comprehensive test suite with 324 tests covering unit, property-based, integration, and chaos testing:
 
 | Test Suite | Count | Description |
 |------------|-------|-------------|
-| **Unit Tests** | 232 | Fast, no external deps |
-| **Doc Tests** | 31 | Example verification |
-| **Property Tests** | 12 | Proptest fuzzing for invariants |
-| **Integration Tests** | 26 | Real Redis Stack/MySQL via testcontainers |
-| **Chaos Tests** | 10 | Failure injection, container killing |
-| **Total** | **311** | ~75% code coverage |
+| **Unit Tests** | 241 ✅ | Fast, no external deps |
+| **Doc Tests** | 31 ✅ | Example verification |
+| **Property Tests** | 12 ✅ | Proptest fuzzing for invariants |
+| **Integration Tests** | 30 ✅ | Real Redis Stack/MySQL via testcontainers |
+| **Chaos Tests** | 10 ✅ | Failure injection, container killing |
+| **Total** | **324** ✅ | ~76.6% code coverage |
 
 ### Running Tests
 

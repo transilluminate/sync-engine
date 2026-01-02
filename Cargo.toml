@@ -1,6 +1,6 @@
 [package]
 name = "sync-engine"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Adrian Robinson <adrian.j.robinson@gmail.com>"]
 description = "High-performance tiered sync engine with L1/L2/L3 caching and Redis/SQL backends"
@@ -39,6 +39,7 @@ redis = { version = "1.0.2", features = ["tokio-comp", "connection-manager"] }
 uuid = { version = "1", features = ["v4"] }
 parking_lot = "0.12"
 rand = "0.8"
+zstd = "0.13"
 
 [dev-dependencies]
 proptest = "1"

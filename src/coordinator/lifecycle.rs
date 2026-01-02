@@ -177,7 +177,9 @@ impl SyncEngine {
                         self.config.redis_prefix.as_deref(),
                     );
                     self.redis_merkle = Some(redis_merkle);
-                    self.l2_store = Some(std::sync::Arc::new(store));
+                    let store = std::sync::Arc::new(store);
+                    self.redis_store = Some(store.clone());  // Keep direct reference for CDC
+                    self.l2_store = Some(store);
                     tracing::Span::current().record("has_redis", true);
                     crate::metrics::set_backend_healthy("redis", true);
                     crate::metrics::record_startup_phase("redis_connect", phase_start.elapsed());

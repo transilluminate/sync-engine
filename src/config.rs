@@ -121,6 +121,21 @@ pub struct SyncEngineConfig {
     /// contention when multiple instances are calculating. Default: 0 (no jitter)
     #[serde(default)]
     pub merkle_calc_jitter_ms: u64,
+    
+    /// CDC Stream: Enable Change Data Capture output to Redis Stream.
+    /// 
+    /// When enabled, every Put/Delete writes to `{redis_prefix}__local__:cdc`.
+    /// This enables external replication agents to tail changes.
+    /// Default: false (opt-in feature)
+    #[serde(default)]
+    pub enable_cdc_stream: bool,
+    
+    /// CDC Stream: Maximum entries before approximate trimming (MAXLEN ~).
+    /// 
+    /// Consumers that fall behind this limit rely on Merkle repair.
+    /// Default: 100,000 entries
+    #[serde(default = "default_cdc_stream_maxlen")]
+    pub cdc_stream_maxlen: u64,
 }
 
 fn default_l1_max_bytes() -> usize { 256 * 1024 * 1024 } // 256 MB
@@ -138,6 +153,7 @@ fn default_redis_eviction_enabled() -> bool { true }
 fn default_redis_eviction_start() -> f64 { 0.75 }
 fn default_redis_eviction_target() -> f64 { 0.60 }
 fn default_merkle_calc_enabled() -> bool { true }
+fn default_cdc_stream_maxlen() -> u64 { 100_000 }
 
 impl Default for SyncEngineConfig {
     fn default() -> Self {
@@ -163,6 +179,8 @@ impl Default for SyncEngineConfig {
             redis_eviction_target: default_redis_eviction_target(),
             merkle_calc_enabled: default_merkle_calc_enabled(),
             merkle_calc_jitter_ms: 0,
+            enable_cdc_stream: false,
+            cdc_stream_maxlen: default_cdc_stream_maxlen(),
         }
     }
 }

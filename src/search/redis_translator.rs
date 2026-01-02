@@ -32,7 +32,7 @@ impl RediSearchTranslator {
         match node {
             QueryNode::Field(field_query) => Self::translate_field(field_query),
             QueryNode::And(nodes) => {
-                let parts: Vec<String> = nodes.iter().map(|n| Self::translate_node(n)).collect();
+                let parts: Vec<String> = nodes.iter().map(Self::translate_node).collect();
                 if parts.len() == 1 {
                     parts[0].clone()
                 } else {
@@ -40,7 +40,7 @@ impl RediSearchTranslator {
                 }
             }
             QueryNode::Or(nodes) => {
-                let parts: Vec<String> = nodes.iter().map(|n| Self::translate_node(n)).collect();
+                let parts: Vec<String> = nodes.iter().map(Self::translate_node).collect();
                 if parts.len() == 1 {
                     parts[0].clone()
                 } else {
@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn test_not_query() {
-        let query = Query::field_eq("deleted", "true").not();
+        let query = Query::field_eq("deleted", "true").negate();
         let redis_query = RediSearchTranslator::translate(&query);
         assert_eq!(redis_query, "-(@deleted:true)");
     }

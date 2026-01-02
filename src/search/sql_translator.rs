@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn test_not_query() {
-        let query = Query::field_eq("deleted", "true").not();
+        let query = Query::field_eq("deleted", "true").negate();
         let sql = SqlTranslator::translate(&query, "data");
         assert_eq!(
             sql.clause,
