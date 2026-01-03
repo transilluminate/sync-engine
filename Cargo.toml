@@ -1,6 +1,6 @@
 [package]
 name = "sync-engine"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 authors = ["Adrian Robinson <adrian.j.robinson@gmail.com>"]
 description = "High-performance tiered sync engine with L1/L2/L3 caching and Redis/SQL backends"
@@ -31,7 +31,7 @@ metrics = "0.22"
 recloser = "1"
 sha2 = "0.10"
 hex = "0.4"
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "mysql", "sqlite", "json"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "mysql", "sqlite", "json"] }
 thiserror = "1"
 async-trait = "0.1"
 expandable-cuckoo-filter = "0.1"
