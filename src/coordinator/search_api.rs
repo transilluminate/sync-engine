@@ -109,8 +109,8 @@ impl SyncEngine {
         })?;
 
         // Build FT.CREATE command with global redis prefix
-        let redis_prefix = self.config.redis_prefix.as_deref();
-        let args = index.to_ft_create_args_with_prefix(redis_prefix);
+        let redis_prefix = self.config.read().redis_prefix.clone();
+        let args = index.to_ft_create_args_with_prefix(redis_prefix.as_deref());
         debug!(index = %index.name, prefix = %index.prefix, redis_prefix = ?redis_prefix, "Creating search index");
 
         // Execute FT.CREATE via raw Redis command
@@ -141,7 +141,7 @@ impl SyncEngine {
             StorageError::Connection("Redis not available".into())
         })?;
 
-        let prefix = self.config.redis_prefix.as_deref().unwrap_or("");
+        let prefix = self.config.read().redis_prefix.clone().unwrap_or_default();
         let index_name = format!("{}idx:{}", prefix, name);
         
         match l2.ft_dropindex(&index_name).await {
@@ -330,7 +330,7 @@ impl SyncEngine {
             StorageError::Connection("Redis not available for raw search".into())
         })?;
 
-        let prefix = self.config.redis_prefix.as_deref().unwrap_or("");
+        let prefix = self.config.read().redis_prefix.clone().unwrap_or_default();
         let index = format!("{}idx:{}", prefix, index_name);
         
         metrics::record_search_query("redis_raw", "attempt");
@@ -414,7 +414,7 @@ impl SyncEngine {
             StorageError::Connection("Redis not available".into())
         })?;
 
-        let prefix = self.config.redis_prefix.as_deref().unwrap_or("");
+        let prefix = self.config.read().redis_prefix.clone().unwrap_or_default();
         let index = format!("{}idx:{}", prefix, index_name);
         let query_str = RediSearchTranslator::translate(query);
         debug!(index = %index, query = %query_str, "FT.SEARCH");

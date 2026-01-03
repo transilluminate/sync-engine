@@ -22,7 +22,7 @@ impl SyncEngine {
     /// Snapshot CF if insert threshold exceeded
     pub(super) async fn maybe_snapshot_cf_by_threshold(&self) {
         let inserts = self.cf_inserts_since_snapshot.load(Ordering::Relaxed);
-        if inserts >= self.config.cf_snapshot_insert_threshold {
+        if inserts >= self.config.read().cf_snapshot_insert_threshold {
             self.snapshot_cuckoo_filters("threshold").await;
         }
     }
@@ -34,7 +34,7 @@ impl SyncEngine {
         drop(last_snapshot);
         
         let inserts = self.cf_inserts_since_snapshot.load(Ordering::Relaxed);
-        if inserts > 0 && elapsed >= self.config.cf_snapshot_interval_secs {
+        if inserts > 0 && elapsed >= self.config.read().cf_snapshot_interval_secs {
             self.snapshot_cuckoo_filters("time").await;
         }
     }
@@ -111,7 +111,8 @@ impl SyncEngine {
         if !wal.has_pending() { return }
         let Some(ref l3) = self.l3_store else { return };
         
-        match wal.drain_to(l3.as_ref(), self.config.wal_drain_batch_size).await {
+        let batch_size = self.config.read().wal_drain_batch_size;
+        match wal.drain_to(l3.as_ref(), batch_size).await {
             Ok(drained_ids) if !drained_ids.is_empty() => {
                 for id in &drained_ids {
                     self.l3_filter.insert(id);
@@ -187,7 +188,7 @@ impl SyncEngine {
                             debug!(written = result.written, ttl = ?ttl_secs, "L2 group write complete");
                             
                             // ====== CDC: Emit PUT entries after successful L2 write ======
-                            if self.config.enable_cdc_stream {
+                            if self.config.read().enable_cdc_stream {
                                 self.emit_cdc_put_batch(&items).await;
                             }
                         }
@@ -262,15 +263,19 @@ impl SyncEngine {
         // ====== Merkle: Calculate for dirty items from SQL ======
         // Only run merkle calculation if enabled for this instance
         // In multi-instance deployments, only designated nodes calculate merkle
-        if self.config.merkle_calc_enabled {
+        let merkle_config = {
+            let cfg = self.config.read();
+            (cfg.merkle_calc_enabled, cfg.merkle_calc_jitter_ms, cfg.batch_flush_count)
+        };
+        if merkle_config.0 {
             // Apply jitter to reduce contention between instances
-            if self.config.merkle_calc_jitter_ms > 0 {
-                let jitter = rand::random::<u64>() % self.config.merkle_calc_jitter_ms;
+            if merkle_config.1 > 0 {
+                let jitter = rand::random::<u64>() % merkle_config.1;
                 tokio::time::sleep(std::time::Duration::from_millis(jitter)).await;
             }
             
             // Fetch dirty items from SQL (up to batch size limit)
-            let dirty_limit = self.config.batch_flush_count.max(1000);
+            let dirty_limit = merkle_config.2.max(1000);
             let dirty_items = if let Some(ref sql) = self.sql_store {
                 match sql.get_dirty_merkle_items(dirty_limit).await {
                     Ok(items) => items,
@@ -439,7 +444,8 @@ impl SyncEngine {
             .collect();
         
         let cdc_start = std::time::Instant::now();
-        match redis.xadd_cdc_batch(&entries, self.config.cdc_stream_maxlen).await {
+        let maxlen = self.config.read().cdc_stream_maxlen;
+        match redis.xadd_cdc_batch(&entries, maxlen).await {
             Ok(ids) => {
                 debug!(count = ids.len(), "CDC PUT entries emitted");
                 crate::metrics::record_cdc_entries("PUT", ids.len());
@@ -462,7 +468,8 @@ impl SyncEngine {
         let entry = CdcEntry::delete(id.to_string());
         
         let cdc_start = std::time::Instant::now();
-        match redis.xadd_cdc(&entry, self.config.cdc_stream_maxlen).await {
+        let maxlen = self.config.read().cdc_stream_maxlen;
+        match redis.xadd_cdc(&entry, maxlen).await {
             Ok(_entry_id) => {
                 debug!(id = %id, "CDC DEL entry emitted");
                 crate::metrics::record_cdc_entries("DEL", 1);

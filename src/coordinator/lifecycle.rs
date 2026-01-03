@@ -37,9 +37,13 @@ impl SyncEngine {
 
         // ========== PHASE 1: Initialize WAL (always first) ==========
         let phase_start = std::time::Instant::now();
-        let wal_path = self.config.wal_path.clone()
-            .unwrap_or_else(|| "./sync_engine_wal.db".to_string());
-        let wal_max_items = self.config.wal_max_items.unwrap_or(1_000_000);
+        let (wal_path, wal_max_items) = {
+            let cfg = self.config.read();
+            (
+                cfg.wal_path.clone().unwrap_or_else(|| "./sync_engine_wal.db".to_string()),
+                cfg.wal_max_items.unwrap_or(1_000_000),
+            )
+        };
         
         let wal = match WriteAheadLog::new(&wal_path, wal_max_items).await {
             Ok(wal) => {
@@ -76,7 +80,8 @@ impl SyncEngine {
 
         // ========== PHASE 2: Connect to SQL (L3 - ground truth) ==========
         let phase_start = std::time::Instant::now();
-        if let Some(ref sql_url) = self.config.sql_url {
+        let sql_url = self.config.read().sql_url.clone();
+        if let Some(ref sql_url) = sql_url {
             info!(url = %sql_url, "Connecting to SQL (L3 - ground truth)...");
             match crate::storage::sql::SqlStore::new(sql_url).await {
                 Ok(store) => {
@@ -168,13 +173,17 @@ impl SyncEngine {
 
         // ========== PHASE 6: Connect to Redis (L2 - cache) ==========
         let phase_start = std::time::Instant::now();
-        if let Some(ref redis_url) = self.config.redis_url {
-            info!(url = %redis_url, prefix = ?self.config.redis_prefix, "Connecting to Redis (L2 - cache)...");
-            match crate::storage::redis::RedisStore::with_prefix(redis_url, self.config.redis_prefix.as_deref()).await {
+        let (redis_url, redis_prefix) = {
+            let cfg = self.config.read();
+            (cfg.redis_url.clone(), cfg.redis_prefix.clone())
+        };
+        if let Some(ref redis_url) = redis_url {
+            info!(url = %redis_url, prefix = ?redis_prefix, "Connecting to Redis (L2 - cache)...");
+            match crate::storage::redis::RedisStore::with_prefix(redis_url, redis_prefix.as_deref()).await {
                 Ok(store) => {
                     let redis_merkle = RedisMerkleStore::with_prefix(
                         store.connection(),
-                        self.config.redis_prefix.as_deref(),
+                        redis_prefix.as_deref(),
                     );
                     self.redis_merkle = Some(redis_merkle);
                     let store = std::sync::Arc::new(store);
@@ -371,7 +380,7 @@ impl SyncEngine {
         info!("Warming up cuckoo filter and L1 cache...");
         
         if let Some(l3) = &self.l3_store {
-            let batch_size = self.config.cuckoo_warmup_batch_size;
+            let batch_size = self.config.read().cuckoo_warmup_batch_size;
             info!(batch_size, "Warming L3 cuckoo filter from MySQL...");
             
             let total_count = l3.count_all().await.unwrap_or(0);
@@ -430,9 +439,22 @@ impl SyncEngine {
         }
     }
 
-    /// Run the main event loop
+    /// Run the main event loop.
+    /// 
+    /// This method takes `&self` (not `&mut self`) so the engine can be
+    /// shared via `Arc` while the run loop executes in a background task.
+    /// 
+    /// # Example
+    /// 
+    /// ```rust,ignore
+    /// let engine = Arc::new(engine);
+    /// let engine_clone = engine.clone();
+    /// tokio::spawn(async move {
+    ///     engine_clone.run().await;
+    /// });
+    /// ```
     #[tracing::instrument(skip(self))]
-    pub async fn run(&mut self) {
+    pub async fn run(&self) {
         let _ = self.state.send(EngineState::Running);
         info!("Sync engine running");
 
@@ -442,18 +464,26 @@ impl SyncEngine {
         let mut wal_drain_interval = tokio::time::interval(
             tokio::time::Duration::from_secs(5)
         );
+        let cf_snapshot_secs = self.config.read().cf_snapshot_interval_secs;
         let mut cf_snapshot_interval = tokio::time::interval(
-            tokio::time::Duration::from_secs(self.config.cf_snapshot_interval_secs)
+            tokio::time::Duration::from_secs(cf_snapshot_secs)
         );
 
         loop {
+            // Lock config_rx only for the check, not across awaits
+            let config_changed = {
+                let rx = self.config_rx.lock().await;
+                // Use poll-style check to avoid holding lock
+                rx.has_changed().unwrap_or(false)
+            };
+            
+            if config_changed {
+                let new_config = self.config_rx.lock().await.borrow_and_update().clone();
+                info!("Config updated: l1_max_bytes={}", new_config.l1_max_bytes);
+                *self.config.write() = new_config;
+            }
+            
             tokio::select! {
-                Ok(()) = self.config_rx.changed() => {
-                    let new_config = self.config_rx.borrow().clone();
-                    info!("Config updated: l1_max_bytes={}", new_config.l1_max_bytes);
-                    self.config = new_config;
-                }
-                
                 _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
                     self.maybe_evict();
                     self.maybe_flush_l2().await;

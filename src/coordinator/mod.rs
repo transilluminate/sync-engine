@@ -82,11 +82,11 @@ use search_api::SearchState;
 /// Internal state uses atomic operations and concurrent data structures.
 pub struct SyncEngine {
     /// Configuration (can be updated at runtime via watch channel)
-    pub(super) config: SyncEngineConfig,
+    /// Uses RwLock for interior mutability so run() can take &self
+    pub(super) config: RwLock<SyncEngineConfig>,
 
-    /// Runtime config updates
-    #[allow(dead_code)]
-    pub(super) config_rx: watch::Receiver<SyncEngineConfig>,
+    /// Runtime config updates (Mutex for interior mutability in run loop)
+    pub(super) config_rx: Mutex<watch::Receiver<SyncEngineConfig>>,
 
     /// Engine state (broadcast to watchers)
     pub(super) state: watch::Sender<EngineState>,
@@ -159,8 +159,8 @@ impl SyncEngine {
         };
 
         Self {
-            config: config.clone(),
-            config_rx,
+            config: RwLock::new(config.clone()),
+            config_rx: Mutex::new(config_rx),
             state: state_tx,
             state_rx,
             l1_cache: Arc::new(DashMap::new()),
@@ -205,7 +205,7 @@ impl SyncEngine {
     #[must_use]
     pub fn memory_pressure(&self) -> f64 {
         let used = self.l1_size_bytes.load(Ordering::Acquire);
-        let max = self.config.l1_max_bytes;
+        let max = self.config.read().l1_max_bytes;
         if max == 0 {
             0.0
         } else {
@@ -526,7 +526,7 @@ impl SyncEngine {
         }
 
         // 6. Emit CDC delete entry (if enabled)
-        if self.config.enable_cdc_stream && found {
+        if self.config.read().enable_cdc_stream && found {
             self.emit_cdc_delete(id).await;
         }
 
@@ -565,7 +565,7 @@ impl SyncEngine {
 
     fn maybe_evict(&self) {
         let pressure = self.memory_pressure();
-        if pressure < self.config.backpressure_warn {
+        if pressure < self.config.read().backpressure_warn {
             return;
         }
 
