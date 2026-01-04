@@ -3,6 +3,139 @@
 
 //! Public types for the sync engine coordinator.
 
+use crate::backpressure::BackpressureLevel;
+use crate::cuckoo::filter_manager::FilterTrust;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HEALTH CHECK - Comprehensive health status for /ready and /health endpoints
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Comprehensive health status of the sync engine.
+///
+/// This struct provides all the information needed for:
+/// - `/ready` endpoint: Just check `healthy` field
+/// - `/health` endpoint: Full diagnostics with data sources documented
+/// - Metrics dashboards: Memory pressure, cache stats, backend latencies
+///
+/// # Data Sources
+///
+/// Each field documents where its value comes from:
+/// - **Live probe**: Fresh check performed during `health_check()` call
+/// - **Cached**: From internal state, no I/O required
+/// - **Derived**: Computed from other fields
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let health = engine.health_check().await;
+/// if health.healthy {
+///     // Ready for traffic
+/// } else {
+///     // Log diagnostics
+///     eprintln!("Engine unhealthy: state={:?}, redis={}, sql={}",
+///         health.state, health.redis_connected, health.sql_connected);
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct HealthCheck {
+    // ═══════════════════════════════════════════════════════════════════════
+    // ENGINE STATE (cached from internal state machine)
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    /// Current engine lifecycle state.
+    /// **Source**: Cached from `state_tx` watch channel.
+    pub state: EngineState,
+    
+    /// Whether the engine is in `Running` state and ready for traffic.
+    /// **Source**: Derived from `state == Running`.
+    pub ready: bool,
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // MEMORY & BACKPRESSURE (cached from atomics/config)
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    /// Current memory pressure ratio (0.0 to 1.0).
+    /// **Source**: Cached from `l1_size_bytes / config.l1_max_bytes`.
+    pub memory_pressure: f64,
+    
+    /// Current backpressure level based on thresholds.
+    /// **Source**: Derived from memory_pressure vs config thresholds.
+    pub backpressure_level: BackpressureLevel,
+    
+    /// Whether the engine is accepting write operations.
+    /// **Source**: Derived from `backpressure_level != Critical`.
+    pub accepting_writes: bool,
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // L1 CACHE (cached from DashMap/atomics)
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    /// Number of items in L1 cache.
+    /// **Source**: Cached from `l1_cache.len()`.
+    pub l1_items: usize,
+    
+    /// Total bytes in L1 cache.
+    /// **Source**: Cached from `l1_size_bytes` atomic.
+    pub l1_bytes: usize,
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // CUCKOO FILTER (cached from FilterManager)
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    /// Number of items tracked in L3 cuckoo filter.
+    /// **Source**: Cached from `l3_filter.len()`.
+    pub filter_items: usize,
+    
+    /// Cuckoo filter trust status.
+    /// **Source**: Cached from `l3_filter.trust()`.
+    pub filter_trust: FilterTrust,
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // BACKEND CONNECTIVITY (live probes during health_check)
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    /// Whether Redis (L2) responded to PING.
+    /// **Source**: Live probe - `redis::cmd("PING")`.
+    /// `None` if Redis is not configured.
+    pub redis_connected: Option<bool>,
+    
+    /// Redis PING latency in milliseconds.
+    /// **Source**: Live probe - timed PING command.
+    /// `None` if Redis is not configured or PING failed.
+    pub redis_latency_ms: Option<u64>,
+    
+    /// Whether SQL (L3) responded to `SELECT 1`.
+    /// **Source**: Live probe - `sqlx::query("SELECT 1")`.
+    /// `None` if SQL is not configured.
+    pub sql_connected: Option<bool>,
+    
+    /// SQL `SELECT 1` latency in milliseconds.
+    /// **Source**: Live probe - timed query.
+    /// `None` if SQL is not configured or query failed.
+    pub sql_latency_ms: Option<u64>,
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // WAL STATUS (cached from WriteAheadLog)
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    /// Number of items pending in WAL (awaiting drain to SQL).
+    /// **Source**: Cached from `l3_wal.stats().pending_items`.
+    /// `None` if WAL is not configured.
+    pub wal_pending_items: Option<u64>,
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // OVERALL VERDICT (derived)
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    /// Overall health verdict for load balancer decisions.
+    /// **Source**: Derived from:
+    /// - `state == Running`
+    /// - `redis_connected != Some(false)` (connected or not configured)
+    /// - `sql_connected != Some(false)` (connected or not configured)
+    /// - `backpressure_level != Critical`
+    pub healthy: bool,
+}
+
 /// Engine lifecycle state.
 ///
 /// The engine progresses through states during startup and shutdown.

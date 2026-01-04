@@ -43,7 +43,7 @@ mod flush;
 mod merkle_api;
 mod search_api;
 
-pub use types::{EngineState, ItemStatus, BatchResult};
+pub use types::{EngineState, ItemStatus, BatchResult, HealthCheck};
 pub use merkle_api::MerkleDiff;
 pub use search_api::{SearchTier, SearchResult, SearchSource};
 #[allow(unused_imports)]
@@ -227,6 +227,131 @@ impl SyncEngine {
     pub fn should_accept_writes(&self) -> bool {
         let pressure = self.pressure();
         !matches!(pressure, BackpressureLevel::Emergency | BackpressureLevel::Shutdown)
+    }
+
+    /// Perform a comprehensive health check.
+    ///
+    /// This probes backend connectivity (Redis PING, SQL SELECT 1) and
+    /// collects internal state into a [`HealthCheck`] struct suitable for
+    /// `/ready` and `/health` endpoints.
+    ///
+    /// # Performance
+    ///
+    /// - **Cached fields**: Instant (no I/O)
+    /// - **Live probes**: Redis PING + SQL SELECT 1 (parallel, ~1-10ms each)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let health = engine.health_check().await;
+    ///
+    /// // For /ready endpoint (load balancer)
+    /// if health.healthy {
+    ///     HttpResponse::Ok().body("ready")
+    /// } else {
+    ///     HttpResponse::ServiceUnavailable().body("not ready")
+    /// }
+    ///
+    /// // For /health endpoint (diagnostics)
+    /// HttpResponse::Ok().json(health)
+    /// ```
+    pub async fn health_check(&self) -> types::HealthCheck {
+        // Cached state (no I/O)
+        let state = self.state();
+        let ready = matches!(state, EngineState::Ready | EngineState::Running);
+        let memory_pressure = self.memory_pressure();
+        let backpressure_level = self.pressure();
+        let accepting_writes = self.should_accept_writes();
+        let (l1_items, l1_bytes) = self.l1_stats();
+        let (filter_items, _, filter_trust) = self.l3_filter_stats();
+        
+        // WAL stats (cached, no I/O)
+        // Note: WalStats doesn't have file_size, so we only report pending items
+        let mysql_healthy = self.mysql_health.is_healthy();
+        let wal_pending_items = if let Some(ref wal) = self.l3_wal {
+            let stats = wal.stats(mysql_healthy);
+            Some(stats.pending_items)
+        } else {
+            None
+        };
+        
+        // Live backend probes (parallel)
+        let (redis_result, sql_result) = tokio::join!(
+            self.probe_redis(),
+            self.probe_sql()
+        );
+        
+        let (redis_connected, redis_latency_ms) = redis_result;
+        let (sql_connected, sql_latency_ms) = sql_result;
+        
+        // Derive overall health
+        // Healthy if: running, backends connected (or not configured), not in critical backpressure
+        let healthy = matches!(state, EngineState::Running)
+            && redis_connected != Some(false)
+            && sql_connected != Some(false)
+            && !matches!(backpressure_level, BackpressureLevel::Emergency | BackpressureLevel::Shutdown);
+        
+        types::HealthCheck {
+            state,
+            ready,
+            memory_pressure,
+            backpressure_level,
+            accepting_writes,
+            l1_items,
+            l1_bytes,
+            filter_items,
+            filter_trust,
+            redis_connected,
+            redis_latency_ms,
+            sql_connected,
+            sql_latency_ms,
+            wal_pending_items,
+            healthy,
+        }
+    }
+    
+    /// Probe Redis connectivity with PING.
+    async fn probe_redis(&self) -> (Option<bool>, Option<u64>) {
+        let Some(ref redis_store) = self.redis_store else {
+            return (None, None); // Redis not configured
+        };
+        
+        let start = std::time::Instant::now();
+        let mut conn = redis_store.connection();
+        
+        let result: Result<String, _> = redis::cmd("PING")
+            .query_async(&mut conn)
+            .await;
+        
+        match result {
+            Ok(_) => {
+                let latency_ms = start.elapsed().as_millis() as u64;
+                (Some(true), Some(latency_ms))
+            }
+            Err(_) => (Some(false), None),
+        }
+    }
+    
+    /// Probe SQL connectivity with SELECT 1.
+    async fn probe_sql(&self) -> (Option<bool>, Option<u64>) {
+        let Some(ref sql_store) = self.sql_store else {
+            return (None, None); // SQL not configured
+        };
+        
+        let start = std::time::Instant::now();
+        let pool = sql_store.pool();
+        
+        let result = sqlx::query("SELECT 1")
+            .fetch_one(&pool)
+            .await;
+        
+        match result {
+            Ok(_) => {
+                let latency_ms = start.elapsed().as_millis() as u64;
+                (Some(true), Some(latency_ms))
+            }
+            Err(_) => (Some(false), None),
+        }
     }
 
     // --- Core CRUD Operations ---
@@ -870,5 +995,31 @@ mod tests {
     fn test_pressure_level() {
         let engine = create_test_engine();
         assert_eq!(engine.pressure(), BackpressureLevel::Normal);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_basic() {
+        let engine = create_test_engine();
+        
+        let health = engine.health_check().await;
+        
+        // Engine is in Created state (not started)
+        assert_eq!(health.state, EngineState::Created);
+        assert!(!health.ready); // Not ready until started
+        assert!(!health.healthy); // Not healthy (not Running)
+        
+        // Memory should be empty
+        assert_eq!(health.memory_pressure, 0.0);
+        assert_eq!(health.l1_items, 0);
+        assert_eq!(health.l1_bytes, 0);
+        
+        // Backpressure should be normal
+        assert_eq!(health.backpressure_level, BackpressureLevel::Normal);
+        assert!(health.accepting_writes);
+        
+        // No backends configured
+        assert!(health.redis_connected.is_none());
+        assert!(health.sql_connected.is_none());
+        assert!(health.wal_pending_items.is_none());
     }
 }

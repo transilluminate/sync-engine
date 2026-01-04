@@ -101,7 +101,10 @@
 //!
 //! ## Modules
 //!
+//! - [`config`]: Engine configuration ([`SyncEngineConfig`])
 //! - [`coordinator`]: The main [`SyncEngine`] orchestrating all components
+//! - [`sync_item`]: Core data structure ([`SyncItem`], [`ContentType`])
+//! - [`submit_options`]: Per-item routing options ([`SubmitOptions`], [`CacheTtl`])
 //! - [`storage`]: Storage backends (Redis, SQL, Memory)
 //! - [`batching`]: Hybrid batcher for efficient writes
 //! - [`cuckoo`]: Probabilistic existence filters
@@ -109,6 +112,9 @@
 //! - [`resilience`]: Circuit breakers, retry logic, WAL
 //! - [`eviction`]: Tan-curve eviction policy
 //! - [`backpressure`]: Memory pressure handling
+//! - [`search`]: RediSearch and SQL query translation
+//! - [`cdc`]: Change Data Capture stream output
+//! - [`metrics`]: OTEL-compatible metrics instrumentation
 
 pub mod config;
 pub mod sync_item;
@@ -128,7 +134,7 @@ pub mod cdc;
 // Note: We don't expose a `tracing` module to avoid conflict with the tracing crate
 
 pub use config::SyncEngineConfig;
-pub use coordinator::{SyncEngine, EngineState, ItemStatus, BatchResult, MerkleDiff};
+pub use coordinator::{SyncEngine, EngineState, ItemStatus, BatchResult, MerkleDiff, HealthCheck};
 pub use backpressure::BackpressureLevel;
 pub use sync_item::{SyncItem, ContentType};
 pub use submit_options::{CacheTtl, OptionsKey, SubmitOptions};

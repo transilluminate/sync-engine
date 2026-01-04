@@ -73,7 +73,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sync-engine = "0.2.6"
+sync-engine = "0.2.7"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
