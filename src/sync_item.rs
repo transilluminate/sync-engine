@@ -267,6 +267,8 @@ impl SyncItem {
         content_hash: String,
         home_instance_id: Option<String>,
         state: String,
+        access_count: u64,
+        last_accessed: u64,
     ) -> Self {
         Self {
             object_id,
@@ -278,8 +280,8 @@ impl SyncItem {
             trace_state: None,
             priority_score: 0.0,
             content_hash,
-            last_accessed: 0,
-            access_count: 0,
+            last_accessed,
+            access_count,
             content,
             home_instance_id,
             state,

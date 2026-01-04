@@ -16,7 +16,9 @@
 //!   payload_hash VARCHAR(64),
 //!   payload LONGTEXT,        -- JSON as text (sqlx Any driver limitation)
 //!   payload_blob MEDIUMBLOB, -- For binary content
-//!   audit TEXT               -- Operational metadata: {batch, trace, home}
+//!   audit TEXT,              -- Operational metadata: {batch, trace, home}
+//!   access_count BIGINT,     -- Local access frequency (for eviction)
+//!   last_accessed BIGINT     -- Last access timestamp (for eviction)
 //! )
 //! ```
 //!
@@ -135,7 +137,9 @@ impl SqlStore {
                 payload_blob BLOB,
                 audit TEXT,
                 merkle_dirty INTEGER NOT NULL DEFAULT 1,
-                state TEXT NOT NULL DEFAULT 'default'
+                state TEXT NOT NULL DEFAULT 'default',
+                access_count INTEGER NOT NULL DEFAULT 0,
+                last_accessed INTEGER NOT NULL DEFAULT 0
             )
             "#
         } else {
@@ -152,6 +156,8 @@ impl SqlStore {
                 audit TEXT,
                 merkle_dirty TINYINT NOT NULL DEFAULT 1,
                 state VARCHAR(32) NOT NULL DEFAULT 'default',
+                access_count BIGINT NOT NULL DEFAULT 0,
+                last_accessed BIGINT NOT NULL DEFAULT 0,
                 INDEX idx_timestamp (timestamp),
                 INDEX idx_merkle_dirty (merkle_dirty),
                 INDEX idx_state (state)
@@ -216,7 +222,7 @@ impl ArchiveStore for SqlStore {
         
         retry("sql_get", &RetryConfig::query(), || async {
             let result = sqlx::query(
-                "SELECT version, timestamp, payload_hash, payload, payload_blob, audit, state FROM sync_items WHERE id = ?"
+                "SELECT version, timestamp, payload_hash, payload, payload_blob, audit, state, access_count, last_accessed FROM sync_items WHERE id = ?"
             )
                 .bind(&id)
                 .fetch_optional(&self.pool)
@@ -253,6 +259,10 @@ impl ArchiveStore for SqlStore {
                         })
                         .unwrap_or_else(|| "default".to_string());
                     
+                    // Access metadata (local eviction stats, not replicated)
+                    let access_count: i64 = row.try_get("access_count").unwrap_or(0);
+                    let last_accessed: i64 = row.try_get("last_accessed").unwrap_or(0);
+                    
                     // Determine content and content_type
                     let (content, content_type) = if let Some(ref json_str) = payload_json {
                         // JSON content - parse and re-serialize to bytes
@@ -279,6 +289,8 @@ impl ArchiveStore for SqlStore {
                         payload_hash.unwrap_or_default(),
                         home_instance_id,
                         state,
+                        access_count as u64,
+                        last_accessed as u64,
                     );
                     Ok(Some(item))
                 }
@@ -308,8 +320,8 @@ impl ArchiveStore for SqlStore {
         };
 
         let sql = if self.is_sqlite {
-            "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty, state) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?) 
+            "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty, state, access_count, last_accessed) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?) 
              ON CONFLICT(id) DO UPDATE SET 
                 version = excluded.version, 
                 timestamp = excluded.timestamp, 
@@ -318,10 +330,12 @@ impl ArchiveStore for SqlStore {
                 payload_blob = excluded.payload_blob, 
                 audit = excluded.audit, 
                 merkle_dirty = 1, 
-                state = excluded.state"
+                state = excluded.state,
+                access_count = excluded.access_count,
+                last_accessed = excluded.last_accessed"
         } else {
-            "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty, state) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?) 
+            "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty, state, access_count, last_accessed) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?) 
              ON DUPLICATE KEY UPDATE 
                 version = VALUES(version), 
                 timestamp = VALUES(timestamp), 
@@ -330,7 +344,9 @@ impl ArchiveStore for SqlStore {
                 payload_blob = VALUES(payload_blob), 
                 audit = VALUES(audit), 
                 merkle_dirty = 1, 
-                state = VALUES(state)"
+                state = VALUES(state),
+                access_count = VALUES(access_count),
+                last_accessed = VALUES(last_accessed)"
         };
 
         retry("sql_put", &RetryConfig::query(), || async {
@@ -343,6 +359,8 @@ impl ArchiveStore for SqlStore {
                 .bind(&payload_blob)
                 .bind(&audit_json)
                 .bind(&state)
+                .bind(item.access_count as i64)
+                .bind(item.last_accessed as i64)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| StorageError::Backend(e.to_string()))?;
@@ -460,12 +478,12 @@ impl SqlStore {
     /// The batch_id is already embedded in each item's audit JSON.
     async fn put_batch_chunk(&self, chunk: &[SyncItem], _batch_id: &str) -> Result<usize, StorageError> {
         let placeholders: Vec<String> = (0..chunk.len())
-            .map(|_| "(?, ?, ?, ?, ?, ?, ?, 1, ?)".to_string())
+            .map(|_| "(?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)".to_string())
             .collect();
         
         let sql = if self.is_sqlite {
             format!(
-                "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty, state) VALUES {} \
+                "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty, state, access_count, last_accessed) VALUES {} \
                  ON CONFLICT(id) DO UPDATE SET \
                     version = excluded.version, \
                     timestamp = excluded.timestamp, \
@@ -474,12 +492,14 @@ impl SqlStore {
                     payload_blob = excluded.payload_blob, \
                     audit = excluded.audit, \
                     merkle_dirty = 1, \
-                    state = excluded.state",
+                    state = excluded.state, \
+                    access_count = excluded.access_count, \
+                    last_accessed = excluded.last_accessed",
                 placeholders.join(", ")
             )
         } else {
             format!(
-                "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty, state) VALUES {} \
+                "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty, state, access_count, last_accessed) VALUES {} \
                  ON DUPLICATE KEY UPDATE \
                     version = VALUES(version), \
                     timestamp = VALUES(timestamp), \
@@ -488,7 +508,9 @@ impl SqlStore {
                     payload_blob = VALUES(payload_blob), \
                     audit = VALUES(audit), \
                     merkle_dirty = 1, \
-                    state = VALUES(state)",
+                    state = VALUES(state), \
+                    access_count = VALUES(access_count), \
+                    last_accessed = VALUES(last_accessed)",
                 placeholders.join(", ")
             )
         };
@@ -504,6 +526,8 @@ impl SqlStore {
             payload_blob: Option<Vec<u8>>,
             audit_json: Option<String>,
             state: String,
+            access_count: i64,
+            last_accessed: i64,
         }
         
         let prepared: Vec<PreparedRow> = chunk.iter()
@@ -527,6 +551,8 @@ impl SqlStore {
                     payload_blob,
                     audit_json: Self::build_audit_json(item),
                     state: item.state.clone(),
+                    access_count: item.access_count as i64,
+                    last_accessed: item.last_accessed as i64,
                 }
             })
             .collect();
@@ -546,7 +572,9 @@ impl SqlStore {
                         .bind(&row.payload_json)
                         .bind(&row.payload_blob)
                         .bind(&row.audit_json)
-                        .bind(&row.state);
+                        .bind(&row.state)
+                        .bind(row.access_count)
+                        .bind(row.last_accessed);
                 }
                 
                 query.execute(&self.pool)
@@ -593,7 +621,7 @@ impl SqlStore {
     /// Scan a batch of items (for WAL drain).
     pub async fn scan_batch(&self, limit: usize) -> Result<Vec<SyncItem>, StorageError> {
         let rows = sqlx::query(
-            "SELECT id, version, timestamp, payload_hash, payload, payload_blob, audit, state FROM sync_items ORDER BY timestamp ASC LIMIT ?"
+            "SELECT id, version, timestamp, payload_hash, payload, payload_blob, audit, state, access_count, last_accessed FROM sync_items ORDER BY timestamp ASC LIMIT ?"
         )
             .bind(limit as i64)
             .fetch_all(&self.pool)
@@ -620,6 +648,10 @@ impl SqlStore {
                 .and_then(|bytes| String::from_utf8(bytes).ok())
                 .unwrap_or_else(|| "default".to_string());
             
+            // Access metadata
+            let access_count: i64 = row.try_get("access_count").unwrap_or(0);
+            let last_accessed: i64 = row.try_get("last_accessed").unwrap_or(0);
+            
             let (content, content_type) = if let Some(ref json_str) = payload_json {
                 (json_str.as_bytes().to_vec(), ContentType::Json)
             } else if let Some(blob) = payload_blob {
@@ -641,6 +673,8 @@ impl SqlStore {
                 payload_hash.unwrap_or_default(),
                 home_instance_id,
                 state,
+                access_count as u64,
+                last_accessed as u64,
             );
             items.push(item);
         }
@@ -758,7 +792,7 @@ impl SqlStore {
     /// Use `mark_merkle_clean()` after processing to clear the flag.
     pub async fn get_dirty_merkle_items(&self, limit: usize) -> Result<Vec<SyncItem>, StorageError> {
         let rows = sqlx::query(
-            "SELECT id, version, timestamp, payload_hash, payload, payload_blob, audit, state 
+            "SELECT id, version, timestamp, payload_hash, payload, payload_blob, audit, state, access_count, last_accessed 
              FROM sync_items WHERE merkle_dirty = 1 LIMIT ?"
         )
             .bind(limit as i64)
@@ -792,6 +826,10 @@ impl SqlStore {
                 .and_then(|bytes| String::from_utf8(bytes).ok())
                 .unwrap_or_else(|| "default".to_string());
             
+            // Access metadata
+            let access_count: i64 = row.try_get("access_count").unwrap_or(0);
+            let last_accessed: i64 = row.try_get("last_accessed").unwrap_or(0);
+            
             // Determine content and content_type
             let (content, content_type) = if let Some(ref json_str) = payload_json {
                 (json_str.as_bytes().to_vec(), ContentType::Json)
@@ -815,6 +853,8 @@ impl SqlStore {
                 payload_hash.unwrap_or_default(),
                 home_instance_id,
                 state,
+                access_count as u64,
+                last_accessed as u64,
             );
             items.push(item);
         }
@@ -831,7 +871,7 @@ impl SqlStore {
     /// Uses indexed query for fast retrieval.
     pub async fn get_by_state(&self, state: &str, limit: usize) -> Result<Vec<SyncItem>, StorageError> {
         let rows = sqlx::query(
-            "SELECT id, version, timestamp, payload_hash, payload, payload_blob, audit, state 
+            "SELECT id, version, timestamp, payload_hash, payload, payload_blob, audit, state, access_count, last_accessed 
              FROM sync_items WHERE state = ? LIMIT ?"
         )
             .bind(state)
@@ -872,6 +912,10 @@ impl SqlStore {
                 })
                 .unwrap_or_else(|| "default".to_string());
             
+            // Access metadata (local-only, not replicated)
+            let access_count: i64 = row.try_get("access_count").unwrap_or(0);
+            let last_accessed: i64 = row.try_get("last_accessed").unwrap_or(0);
+            
             let (content, content_type) = if let Some(ref json_str) = payload_json {
                 (json_str.as_bytes().to_vec(), ContentType::Json)
             } else if let Some(blob) = payload_blob {
@@ -893,6 +937,8 @@ impl SqlStore {
                 payload_hash.unwrap_or_default(),
                 home_instance_id,
                 state,
+                access_count as u64,
+                last_accessed as u64,
             );
             items.push(item);
         }
@@ -973,7 +1019,7 @@ impl SqlStore {
         let pattern = format!("{}%", prefix);
         
         let rows = sqlx::query(
-            "SELECT id, version, timestamp, payload_hash, payload, payload_blob, audit, state 
+            "SELECT id, version, timestamp, payload_hash, payload, payload_blob, audit, state, access_count, last_accessed 
              FROM sync_items WHERE id LIKE ? ORDER BY id LIMIT ?"
         )
             .bind(&pattern)
@@ -1014,6 +1060,10 @@ impl SqlStore {
                 })
                 .unwrap_or_else(|| "default".to_string());
             
+            // Access metadata (local-only, not replicated)
+            let access_count: i64 = row.try_get("access_count").unwrap_or(0);
+            let last_accessed: i64 = row.try_get("last_accessed").unwrap_or(0);
+            
             let (content, content_type) = if let Some(ref json_str) = payload_json {
                 (json_str.as_bytes().to_vec(), ContentType::Json)
             } else if let Some(blob) = payload_blob {
@@ -1035,6 +1085,8 @@ impl SqlStore {
                 payload_hash.unwrap_or_default(),
                 home_instance_id,
                 state,
+                access_count as u64,
+                last_accessed as u64,
             );
             items.push(item);
         }

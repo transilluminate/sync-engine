@@ -116,6 +116,8 @@ impl RedisStore {
     ///   "timestamp": 1767084657058,
     ///   "payload_hash": "abc123...",
     ///   "state": "default",
+    ///   "access_count": 5,
+    ///   "last_accessed": 1767084660000,
     ///   "payload": {"name": "Alice", ...},
     ///   "audit": {"batch": "...", "trace": "...", "home": "..."}
     /// }
@@ -142,6 +144,8 @@ impl RedisStore {
             "version": item.version,
             "timestamp": item.updated_at,
             "state": item.state,
+            "access_count": item.access_count,
+            "last_accessed": item.last_accessed,
             "payload": payload
         });
         
@@ -170,6 +174,10 @@ impl RedisStore {
         let content_hash = doc.get("payload_hash").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let state = doc.get("state").and_then(|v| v.as_str()).unwrap_or("default").to_string();
         
+        // Access metadata (local-only, not replicated)
+        let access_count = doc.get("access_count").and_then(|v| v.as_u64()).unwrap_or(0);
+        let last_accessed = doc.get("last_accessed").and_then(|v| v.as_u64()).unwrap_or(0);
+        
         // Audit fields (nested)
         let audit = doc.get("audit");
         let batch_id = audit.and_then(|a| a.get("batch")).and_then(|v| v.as_str()).map(String::from);
@@ -192,6 +200,8 @@ impl RedisStore {
             content_hash,
             home_instance_id,
             state,
+            access_count,
+            last_accessed,
         ))
     }
 
