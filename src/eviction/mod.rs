@@ -1,3 +1,6 @@
+// Copyright (c) 2025-2026 Adrian Robinson. Licensed under the AGPL-3.0.
+// See LICENSE file in the project root for full license text.
+
 //! Eviction policies for tiered cache management.
 //!
 //! This module contains eviction logic for both L1 (in-memory) and L2 (Redis)

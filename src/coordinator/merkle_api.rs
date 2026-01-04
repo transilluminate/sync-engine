@@ -1,3 +1,6 @@
+// Copyright (c) 2025-2026 Adrian Robinson. Licensed under the AGPL-3.0.
+// See LICENSE file in the project root for full license text.
+
 //! Public Merkle tree accessor API for external sync.
 //!
 //! This module exposes merkle tree queries for use by external nodes in a 

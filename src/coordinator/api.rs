@@ -1,3 +1,6 @@
+// Copyright (c) 2025-2026 Adrian Robinson. Licensed under the AGPL-3.0.
+// See LICENSE file in the project root for full license text.
+
 //! V1.1 API: Query and batch operations.
 //!
 //! This module contains the higher-level API methods added in V1.1:

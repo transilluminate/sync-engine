@@ -1,3 +1,6 @@
+// Copyright (c) 2025-2026 Adrian Robinson. Licensed under the AGPL-3.0.
+// See LICENSE file in the project root for full license text.
+
 //! SQL storage for Merkle tree nodes (ground truth).
 //!
 //! The SQL merkle store is the authoritative source for merkle hashes.

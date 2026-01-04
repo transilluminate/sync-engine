@@ -1,3 +1,6 @@
+// Copyright (c) 2025-2026 Adrian Robinson. Licensed under the AGPL-3.0.
+// See LICENSE file in the project root for full license text.
+
 //! Redis storage backend for L2 cache.
 //!
 //! Content-type aware storage using RedisJSON (Redis Stack):

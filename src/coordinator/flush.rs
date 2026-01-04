@@ -1,3 +1,6 @@
+// Copyright (c) 2025-2026 Adrian Robinson. Licensed under the AGPL-3.0.
+// See LICENSE file in the project root for full license text.
+
 //! Batch flushing and maintenance operations.
 //!
 //! Internal operations for flushing batches to L2/L3, WAL management,
