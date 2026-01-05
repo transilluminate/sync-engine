@@ -73,7 +73,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sync-engine = "0.2.7"
+sync-engine = "0.2.8"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
@@ -225,10 +225,10 @@ engine.submit(user).await?;
 let query = Query::field_eq("name", "Alice Smith")
     .and(Query::numeric_range("age", Some(25.0), Some(35.0)));
 
-let results = engine.search("users", &query, 100).await?;
+let results = engine.search("users", &query).await?;
 
 // Tag-based queries
-let admins = engine.search("users", &Query::tags("roles", vec!["admin"]), 100).await?;
+let admins = engine.search("users", &Query::tags("roles", vec!["admin".into()])).await?;
 
 // Use SearchTier for control over Redis vs SQL
 let redis_only = engine.search_with_options("users", &query, SearchTier::RedisOnly, 100).await?;
@@ -238,8 +238,46 @@ let redis_only = engine.search_with_options("users", &query, SearchTier::RedisOn
 - **Text fields**: Full-text search with phrase matching
 - **Numeric fields**: Range queries with optional sorting
 - **Tag fields**: Exact multi-value matching with OR semantics
+- **Vector fields**: Similarity search with HNSW or FLAT algorithms (redis only)
 - **Compound queries**: `.and()`, `.or()`, `.negate()` for complex filters
 - **Search cache**: Merkle-invalidated SQL result caching for hybrid queries
+
+### Vector Similarity Search
+
+Create vector indices for semantic search using RediSearch's vector capabilities:
+
+```rust
+use sync_engine::search::{SearchIndex, DistanceMetric, VectorParams};
+
+// HNSW index for fast approximate nearest neighbor search
+let index = SearchIndex::new("documents", "crdt:documents:")
+    .text("title")
+    .text("content")
+    .vector_hnsw("embedding", 1536, DistanceMetric::Cosine);  // OpenAI dimensions
+
+engine.create_search_index(index).await?;
+
+// For smaller datasets, FLAT provides exact results
+let small_index = SearchIndex::new("items", "crdt:items:")
+    .vector_flat("embedding", 384, DistanceMetric::L2);  // sentence-transformers
+
+// Tune HNSW parameters for your use case
+let tuned = VectorParams::hnsw(1536, DistanceMetric::Cosine)
+    .with_m(32)                // More edges = better recall, more memory
+    .with_ef_construction(400); // Higher = better index quality, slower build
+
+let optimized_index = SearchIndex::new("docs", "crdt:docs:")
+    .vector_with_params("embedding", tuned);
+```
+
+**Vector Algorithms:**
+- **HNSW**: Hierarchical Navigable Small World - fast approximate search, O(log n)
+- **FLAT**: Brute-force exact search - O(n), best for <10k vectors
+
+**Distance Metrics:**
+- **Cosine**: Best for text embeddings (OpenAI, Cohere, etc.)
+- **L2**: Euclidean distance for dense embeddings
+- **InnerProduct**: For pre-normalized vectors
 
 ## Configuration
 
@@ -286,12 +324,12 @@ Comprehensive test suite with 324 tests covering unit, property-based, integrati
 
 | Test Suite | Count | Description |
 |------------|-------|-------------|
-| **Unit Tests** | 241 ✅ | Fast, no external deps |
-| **Doc Tests** | 31 ✅ | Example verification |
+| **Unit Tests** | 251 ✅ | Fast, no external deps |
+| **Doc Tests** | 33 ✅ | Example verification |
 | **Property Tests** | 12 ✅ | Proptest fuzzing for invariants |
 | **Integration Tests** | 30 ✅ | Real Redis Stack/MySQL via testcontainers |
 | **Chaos Tests** | 10 ✅ | Failure injection, container killing |
-| **Total** | **324** ✅ | ~76% code coverage |
+| **Total** | **337** ✅ | ~76% code coverage |
 
 ### Running Tests
 

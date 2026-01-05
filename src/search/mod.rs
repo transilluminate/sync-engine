@@ -60,5 +60,8 @@ mod search_cache;
 pub use query_builder::{Query, QueryBuilder, QueryNode, FieldQuery, FieldOperator, QueryValue};
 pub use redis_translator::RediSearchTranslator;
 pub use sql_translator::{SqlTranslator, SqlQuery, SqlParam};
-pub use index_manager::{IndexManager, SearchIndex, SearchField, SearchFieldType};
+pub use index_manager::{
+    DistanceMetric, IndexManager, SearchField, SearchFieldType, SearchIndex, VectorAlgorithm,
+    VectorParams,
+};
 pub use search_cache::{SearchCache, SearchCacheStats};
