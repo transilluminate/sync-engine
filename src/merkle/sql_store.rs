@@ -227,23 +227,16 @@ impl SqlMerkleStore {
     /// Apply a batch of merkle updates atomically.
     ///
     /// This stores leaf hashes and recomputes affected interior nodes.
+    /// Note: Session-level READ COMMITTED is set in SqlStore::new() for MySQL.
     #[instrument(skip(self, batch), fields(batch_size = batch.len()))]
     pub async fn apply_batch(&self, batch: &MerkleBatch) -> Result<(), StorageError> {
         if batch.is_empty() {
             return Ok(());
         }
 
-        // Start transaction with READ COMMITTED isolation (reduces gap locks on MySQL)
+        // Start transaction (READ COMMITTED already set at session level for MySQL)
         let mut tx = self.pool.begin().await
             .map_err(|e| StorageError::Backend(format!("Failed to begin transaction: {}", e)))?;
-
-        // MySQL: Set READ COMMITTED to reduce gap locking and deadlocks
-        if !self.is_sqlite {
-            sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| StorageError::Backend(format!("Failed to set isolation level: {}", e)))?;
-        }
 
         // Step 1: Apply leaf updates
         for (object_id, maybe_hash) in &batch.leaves {
