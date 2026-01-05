@@ -72,11 +72,16 @@ impl SqlTranslator {
         match node {
             QueryNode::Field(field_query) => Self::translate_field(field_query, json_col, params),
             QueryNode::And(nodes) => {
+                // Filter out vector nodes (not supported in SQL)
                 let parts: Vec<String> = nodes
                     .iter()
+                    .filter(|n| !matches!(n, QueryNode::Vector(_)))
                     .map(|n| Self::translate_node(n, json_col, params))
                     .collect();
-                if parts.len() == 1 {
+                if parts.is_empty() {
+                    // Only had vector query, return true (match all)
+                    "1=1".to_string()
+                } else if parts.len() == 1 {
                     parts[0].clone()
                 } else {
                     format!("({})", parts.join(" AND "))
@@ -85,9 +90,12 @@ impl SqlTranslator {
             QueryNode::Or(nodes) => {
                 let parts: Vec<String> = nodes
                     .iter()
+                    .filter(|n| !matches!(n, QueryNode::Vector(_)))
                     .map(|n| Self::translate_node(n, json_col, params))
                     .collect();
-                if parts.len() == 1 {
+                if parts.is_empty() {
+                    "1=1".to_string()
+                } else if parts.len() == 1 {
                     parts[0].clone()
                 } else {
                     format!("({})", parts.join(" OR "))
@@ -95,6 +103,12 @@ impl SqlTranslator {
             }
             QueryNode::Not(inner) => {
                 format!("NOT ({})", Self::translate_node(inner, json_col, params))
+            }
+            QueryNode::Vector(_) => {
+                // Vector search is not supported in SQL fallback
+                // Return a condition that matches nothing (or we could panic)
+                // For graceful degradation, we return 1=0 (false)
+                "1=0 /* vector search not supported in SQL */".to_string()
             }
         }
     }

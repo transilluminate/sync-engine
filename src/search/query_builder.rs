@@ -94,6 +94,62 @@ impl Query {
         }))
     }
 
+    /// Create a vector similarity (KNN) search query.
+    ///
+    /// Returns the k nearest neighbors by vector similarity.
+    ///
+    /// # Arguments
+    /// * `field` - The vector field name (must be indexed with vector_hnsw/vector_flat)
+    /// * `vector` - Query embedding vector (must match field dimensionality)
+    /// * `k` - Number of nearest neighbors to return
+    ///
+    /// # Example
+    /// ```ignore
+    /// let embedding = vec![0.1, 0.2, 0.3, /* ... 1536 dims for OpenAI */];
+    /// let query = Query::vector("embedding", embedding, 10);
+    /// let results = engine.search("documents", &query).await?;
+    /// ```
+    pub fn vector(field: impl Into<String>, vector: Vec<f32>, k: usize) -> Self {
+        Self::new(QueryNode::Vector(VectorQuery {
+            field: field.into(),
+            vector,
+            k,
+        }))
+    }
+
+    /// Create a filtered vector search query.
+    ///
+    /// Combines a filter query with vector KNN search. The filter is applied
+    /// first, then KNN is performed on the filtered results.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let embedding = get_embedding("semantic search query");
+    /// let query = Query::vector_filtered(
+    ///     Query::tags("category", vec!["tech".into()]),
+    ///     "embedding",
+    ///     embedding,
+    ///     10
+    /// );
+    /// ```
+    pub fn vector_filtered(
+        filter: Query,
+        field: impl Into<String>,
+        vector: Vec<f32>,
+        k: usize,
+    ) -> Self {
+        // Combine filter with vector search using AND
+        // The translator will handle the special KNN syntax
+        Self::new(QueryNode::And(vec![
+            filter.root,
+            QueryNode::Vector(VectorQuery {
+                field: field.into(),
+                vector,
+                k,
+            }),
+        ]))
+    }
+
     /// Combine with AND
     pub fn and(self, other: Query) -> Self {
         Self::new(QueryNode::And(vec![self.root, other.root]))
@@ -121,6 +177,19 @@ pub enum QueryNode {
     Or(Vec<QueryNode>),
     /// Boolean NOT: -query
     Not(Box<QueryNode>),
+    /// Vector KNN search: [KNN k @field $blob]
+    Vector(VectorQuery),
+}
+
+/// Vector similarity search query (KNN)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VectorQuery {
+    /// Vector field name (e.g., "embedding")
+    pub field: String,
+    /// Query vector (will be serialized as FLOAT32 blob)
+    pub vector: Vec<f32>,
+    /// Number of nearest neighbors to return
+    pub k: usize,
 }
 
 /// Field query

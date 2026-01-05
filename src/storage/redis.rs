@@ -452,6 +452,48 @@ impl CacheStore for RedisStore {
         .await
         .map_err(|e: redis::RedisError| StorageError::Backend(e.to_string()))
     }
+
+    /// Search using RediSearch with binary parameters (for vector KNN search).
+    /// Uses FT.SEARCH index query PARAMS n name blob... LIMIT offset count NOCONTENT
+    async fn ft_search_with_params(
+        &self,
+        index: &str,
+        query: &str,
+        params: &[(String, Vec<u8>)],
+        limit: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        let conn = self.connection.clone();
+        let index = index.to_string();
+        let query = query.to_string();
+        let params: Vec<(String, Vec<u8>)> = params.to_vec();
+
+        retry("redis_ft_search_knn", &RetryConfig::query(), || {
+            let mut conn = conn.clone();
+            let index = index.clone();
+            let query = query.clone();
+            let params = params.clone();
+            async move {
+                // FT.SEARCH index query PARAMS n name1 blob1 name2 blob2... LIMIT 0 limit NOCONTENT
+                let mut command = cmd("FT.SEARCH");
+                command.arg(&index).arg(&query);
+
+                // Add PARAMS section: PARAMS {count} {name} {blob}...
+                if !params.is_empty() {
+                    command.arg("PARAMS").arg(params.len() * 2);
+                    for (name, blob) in &params {
+                        command.arg(name).arg(blob.as_slice());
+                    }
+                }
+
+                command.arg("LIMIT").arg(0).arg(limit).arg("NOCONTENT");
+
+                let result: redis::Value = command.query_async(&mut conn).await?;
+                Self::parse_ft_search_response(result)
+            }
+        })
+        .await
+        .map_err(|e: redis::RedisError| StorageError::Backend(e.to_string()))
+    }
 }
 
 impl RedisStore {

@@ -49,6 +49,7 @@
 //! @name:*alice*             - Wildcard contains
 //! @name:ali*                - Prefix match
 //! @name:%alice%             - Fuzzy match (Levenshtein)
+//! (filter)=>[KNN 10 @embedding $blob]  - Vector KNN search
 //! ```
 
 mod query_builder;
@@ -57,8 +58,8 @@ mod sql_translator;
 mod index_manager;
 mod search_cache;
 
-pub use query_builder::{Query, QueryBuilder, QueryNode, FieldQuery, FieldOperator, QueryValue};
-pub use redis_translator::RediSearchTranslator;
+pub use query_builder::{Query, QueryBuilder, QueryNode, FieldQuery, FieldOperator, QueryValue, VectorQuery};
+pub use redis_translator::{RediSearchTranslator, TranslatedQuery};
 pub use sql_translator::{SqlTranslator, SqlQuery, SqlParam};
 pub use index_manager::{
     DistanceMetric, IndexManager, SearchField, SearchFieldType, SearchIndex, VectorAlgorithm,

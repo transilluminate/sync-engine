@@ -81,6 +81,19 @@ pub trait CacheStore: Send + Sync {
         let _ = (index, query, limit);
         Err(StorageError::Backend("FT.SEARCH not supported".into()))
     }
+
+    /// Search using RediSearch with binary parameters (for vector KNN search).
+    /// The params are (name, blob) pairs passed as PARAMS to FT.SEARCH.
+    async fn ft_search_with_params(
+        &self,
+        index: &str,
+        query: &str,
+        params: &[(String, Vec<u8>)],
+        limit: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        let _ = (index, query, params, limit);
+        Err(StorageError::Backend("FT.SEARCH with PARAMS not supported".into()))
+    }
 }
 
 #[async_trait]

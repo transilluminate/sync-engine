@@ -419,10 +419,19 @@ impl SyncEngine {
 
         let prefix = self.config.read().redis_prefix.clone().unwrap_or_default();
         let index = format!("{}idx:{}", prefix, index_name);
-        let query_str = RediSearchTranslator::translate(query);
-        debug!(index = %index, query = %query_str, "FT.SEARCH");
+        
+        // Translate query with potential vector parameters
+        let translated = RediSearchTranslator::translate_with_params(query);
+        debug!(index = %index, query = %translated.query, has_params = %translated.has_params(), "FT.SEARCH");
 
-        let keys = l2.ft_search(&index, &query_str, limit).await?;
+        let keys = if translated.has_params() {
+            // Vector search with binary parameters
+            l2.ft_search_with_params(&index, &translated.query, &translated.params, limit).await?
+        } else {
+            // Regular search
+            l2.ft_search(&index, &translated.query, limit).await?
+        };
+        
         self.fetch_items_by_keys(&keys).await
     }
 

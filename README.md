@@ -73,7 +73,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sync-engine = "0.2.8"
+sync-engine = "0.2.9"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
@@ -238,7 +238,7 @@ let redis_only = engine.search_with_options("users", &query, SearchTier::RedisOn
 - **Text fields**: Full-text search with phrase matching
 - **Numeric fields**: Range queries with optional sorting
 - **Tag fields**: Exact multi-value matching with OR semantics
-- **Vector fields**: Similarity search with HNSW or FLAT algorithms (redis only)
+- **Vector fields**: Similarity search with HNSW or FLAT algorithms (redisearch only)
 - **Compound queries**: `.and()`, `.or()`, `.negate()` for complex filters
 - **Search cache**: Merkle-invalidated SQL result caching for hybrid queries
 
@@ -278,6 +278,37 @@ let optimized_index = SearchIndex::new("docs", "crdt:docs:")
 - **Cosine**: Best for text embeddings (OpenAI, Cohere, etc.)
 - **L2**: Euclidean distance for dense embeddings
 - **InnerProduct**: For pre-normalized vectors
+
+### Vector Search Queries
+
+Query vector fields using KNN (k-nearest neighbors) search:
+
+```rust
+use sync_engine::search::Query;
+
+// Generate embedding from your model (e.g., OpenAI, sentence-transformers)
+let query_embedding: Vec<f32> = get_embedding("search query text");
+
+// Simple vector search - find 10 nearest neighbors
+let query = Query::vector("embedding", query_embedding.clone(), 10);
+let results = engine.search("documents", &query).await?;
+
+// Filtered vector search - KNN within a subset
+let query = Query::vector_filtered(
+    Query::tags("category", vec!["tech".into()]),  // Pre-filter
+    "embedding",
+    query_embedding,
+    10
+);
+let results = engine.search("documents", &query).await?;
+
+// Complex filters with vector search
+let filter = Query::field_eq("status", "published")
+    .and(Query::numeric_range("year", Some(2024.0), None));
+let query = Query::vector_filtered(filter, "embedding", embedding, 20);
+```
+
+**Note:** Vector search is Redis-only (no SQL fallback). The filter is applied first, then KNN runs on the filtered results.
 
 ## Configuration
 
@@ -324,12 +355,12 @@ Comprehensive test suite with 324 tests covering unit, property-based, integrati
 
 | Test Suite | Count | Description |
 |------------|-------|-------------|
-| **Unit Tests** | 251 ✅ | Fast, no external deps |
+| **Unit Tests** | 256 ✅ | Fast, no external deps |
 | **Doc Tests** | 33 ✅ | Example verification |
 | **Property Tests** | 12 ✅ | Proptest fuzzing for invariants |
 | **Integration Tests** | 30 ✅ | Real Redis Stack/MySQL via testcontainers |
 | **Chaos Tests** | 10 ✅ | Failure injection, container killing |
-| **Total** | **337** ✅ | ~76% code coverage |
+| **Total** | **341** ✅ | ~77% code coverage |
 
 ### Running Tests
 
