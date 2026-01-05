@@ -89,6 +89,21 @@ impl RetryConfig {
         }
     }
 
+    /// Retry config for batch writes (SQL/Redis).
+    /// 
+    /// More aggressive than `query()` to handle transient deadlocks (MySQL 1213)
+    /// and connection contention under high concurrency. 5 attempts with
+    /// randomized initial delay to reduce thundering herd.
+    #[must_use]
+    pub fn batch_write() -> Self {
+        Self {
+            max_retries: Some(5),
+            initial_delay: Duration::from_millis(50 + (rand::random::<u64>() % 100)), // 50-150ms jitter
+            max_delay: Duration::from_secs(5),
+            factor: 2.0,
+        }
+    }
+
     /// Fast retry for tests (minimal delays)
     #[cfg(test)]
     pub fn test() -> Self {

@@ -540,7 +540,7 @@ impl RedisStore {
         let conn = self.connection.clone();
         let prefix = self.prefix.clone();
         
-        retry("redis_put_batch", &RetryConfig::query(), || {
+        retry("redis_put_batch", &RetryConfig::batch_write(), || {
             let mut conn = conn.clone();
             let prepared = prepared.clone();
             let prefix = prefix.clone();

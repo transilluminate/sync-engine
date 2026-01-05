@@ -555,7 +555,19 @@ impl SyncEngine {
         // This prevents filter/storage divergence if writes fail.
         
         // Queue for batched L2/L3 persistence
-        self.l2_batcher.lock().await.add(item);
+        let batch_to_flush = {
+            let mut batcher = self.l2_batcher.lock().await;
+            if let Some(reason) = batcher.add(item) {
+                batcher.force_flush_with_reason(reason)
+            } else {
+                None
+            }
+        };
+
+        if let Some(batch) = batch_to_flush {
+            // Flush immediately (provides backpressure)
+            self.flush_batch_internal(batch).await;
+        }
 
         debug!(id = %id, "Item submitted to L1 and batch queue");
         crate::metrics::record_latency("L1", "submit", start.elapsed());

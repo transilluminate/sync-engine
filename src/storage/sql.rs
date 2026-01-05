@@ -405,13 +405,16 @@ impl ArchiveStore for SqlStore {
             });
         }
 
-        // Generate a unique batch ID
+        // Generate a unique batch ID (for audit trail, not verification)
         let batch_id = uuid::Uuid::new_v4().to_string();
         
         // Stamp all items with the batch_id
         for item in items.iter_mut() {
             item.batch_id = Some(batch_id.clone());
         }
+
+        // Collect IDs for verification
+        let item_ids: Vec<String> = items.iter().map(|i| i.object_id.clone()).collect();
 
         // MySQL max_allowed_packet is typically 16MB, so chunk into ~500 item batches
         const CHUNK_SIZE: usize = 500;
@@ -422,8 +425,8 @@ impl ArchiveStore for SqlStore {
             total_written += written;
         }
 
-        // Verify the batch was written
-        let verified_count = self.verify_batch(&batch_id).await?;
+        // Verify ALL items exist (not by batch_id - that's unreliable under concurrency)
+        let verified_count = self.verify_batch_ids(&item_ids).await?;
         let verified = verified_count == items.len();
 
         if !verified {
@@ -557,7 +560,7 @@ impl SqlStore {
             })
             .collect();
 
-        retry("sql_put_batch", &RetryConfig::query(), || {
+        retry("sql_put_batch", &RetryConfig::batch_write(), || {
             let sql = sql.clone();
             let prepared = prepared.clone();
             async move {
@@ -589,7 +592,45 @@ impl SqlStore {
         Ok(chunk.len())
     }
 
-    /// Verify a batch was written by counting items with the given batch_id (in audit JSON).
+    /// Verify a batch was written by checking all IDs exist.
+    /// This is more reliable than batch_id verification under concurrent writes.
+    async fn verify_batch_ids(&self, ids: &[String]) -> Result<usize, StorageError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        // Use chunked EXISTS queries to avoid overly large IN clauses
+        const CHUNK_SIZE: usize = 500;
+        let mut total_found = 0usize;
+
+        for chunk in ids.chunks(CHUNK_SIZE) {
+            let placeholders: Vec<&str> = (0..chunk.len()).map(|_| "?").collect();
+            let sql = format!(
+                "SELECT COUNT(*) as cnt FROM sync_items WHERE id IN ({})",
+                placeholders.join(", ")
+            );
+
+            let mut query = sqlx::query(&sql);
+            for id in chunk {
+                query = query.bind(id);
+            }
+
+            let result = query
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+
+            let count: i64 = result
+                .try_get("cnt")
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            total_found += count as usize;
+        }
+
+        Ok(total_found)
+    }
+
+    /// Legacy batch_id verification (kept for reference, but not used under concurrency)
+    #[allow(dead_code)]
     async fn verify_batch(&self, batch_id: &str) -> Result<usize, StorageError> {
         let batch_id = batch_id.to_string();
         

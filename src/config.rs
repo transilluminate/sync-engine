@@ -139,6 +139,21 @@ pub struct SyncEngineConfig {
     /// Default: 100,000 entries
     #[serde(default = "default_cdc_stream_maxlen")]
     pub cdc_stream_maxlen: u64,
+
+    /// Redis command timeout in milliseconds.
+    /// 
+    /// Maximum time to wait for a Redis command to complete before timing out.
+    /// Under high load, increase this value to avoid spurious timeouts.
+    /// Default: 5000 (5 seconds)
+    #[serde(default = "default_redis_timeout_ms")]
+    pub redis_timeout_ms: u64,
+
+    /// Redis response timeout in milliseconds.
+    /// 
+    /// Maximum time to wait for Redis to respond after sending a command.
+    /// Default: 5000 (5 seconds)
+    #[serde(default = "default_redis_response_timeout_ms")]
+    pub redis_response_timeout_ms: u64,
 }
 
 fn default_l1_max_bytes() -> usize { 256 * 1024 * 1024 } // 256 MB
@@ -157,6 +172,8 @@ fn default_redis_eviction_start() -> f64 { 0.75 }
 fn default_redis_eviction_target() -> f64 { 0.60 }
 fn default_merkle_calc_enabled() -> bool { true }
 fn default_cdc_stream_maxlen() -> u64 { 100_000 }
+fn default_redis_timeout_ms() -> u64 { 5_000 }
+fn default_redis_response_timeout_ms() -> u64 { 5_000 }
 
 impl Default for SyncEngineConfig {
     fn default() -> Self {
@@ -184,6 +201,8 @@ impl Default for SyncEngineConfig {
             merkle_calc_jitter_ms: 0,
             enable_cdc_stream: false,
             cdc_stream_maxlen: default_cdc_stream_maxlen(),
+            redis_timeout_ms: default_redis_timeout_ms(),
+            redis_response_timeout_ms: default_redis_response_timeout_ms(),
         }
     }
 }
