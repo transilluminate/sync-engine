@@ -233,9 +233,17 @@ impl SqlMerkleStore {
             return Ok(());
         }
 
-        // Start transaction
+        // Start transaction with READ COMMITTED isolation (reduces gap locks on MySQL)
         let mut tx = self.pool.begin().await
             .map_err(|e| StorageError::Backend(format!("Failed to begin transaction: {}", e)))?;
+
+        // MySQL: Set READ COMMITTED to reduce gap locking and deadlocks
+        if !self.is_sqlite {
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Backend(format!("Failed to set isolation level: {}", e)))?;
+        }
 
         // Step 1: Apply leaf updates
         for (object_id, maybe_hash) in &batch.leaves {

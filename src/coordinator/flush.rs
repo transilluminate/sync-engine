@@ -209,6 +209,9 @@ impl SyncEngine {
             if options.sql {
                 if self.mysql_health.is_healthy() {
                     if let Some(ref l3) = self.l3_store {
+                        // Acquire semaphore permit to limit concurrent SQL writes
+                        let _permit = self.sql_write_semaphore.acquire().await;
+                        
                         let l3_start = std::time::Instant::now();
                         match l3.put_batch(&mut items).await {
                             Ok(result) => {
@@ -308,8 +311,10 @@ impl SyncEngine {
                 }
                 
                 // Apply merkle batch to SQL (ground truth) and Redis (cache)
+                // Acquire semaphore to limit concurrent SQL merkle writes
                 let mut sql_success = false;
                 if let Some(ref sql_merkle) = self.sql_merkle {
+                    let _permit = self.sql_write_semaphore.acquire().await;
                     if let Err(e) = sql_merkle.apply_batch(&merkle_batch).await {
                         error!(error = %e, "Failed to update SQL Merkle tree (ground truth)");
                     } else {

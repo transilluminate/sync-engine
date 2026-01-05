@@ -154,6 +154,14 @@ pub struct SyncEngineConfig {
     /// Default: 5000 (5 seconds)
     #[serde(default = "default_redis_response_timeout_ms")]
     pub redis_response_timeout_ms: u64,
+
+    /// Maximum concurrent SQL write operations.
+    /// 
+    /// Limits simultaneous sql_put_batch and merkle_nodes updates to reduce
+    /// row-level lock contention and deadlocks under high load.
+    /// Default: 4 (good balance for most MySQL setups)
+    #[serde(default = "default_sql_write_concurrency")]
+    pub sql_write_concurrency: usize,
 }
 
 fn default_l1_max_bytes() -> usize { 256 * 1024 * 1024 } // 256 MB
@@ -174,6 +182,7 @@ fn default_merkle_calc_enabled() -> bool { true }
 fn default_cdc_stream_maxlen() -> u64 { 100_000 }
 fn default_redis_timeout_ms() -> u64 { 5_000 }
 fn default_redis_response_timeout_ms() -> u64 { 5_000 }
+fn default_sql_write_concurrency() -> usize { 4 }
 
 impl Default for SyncEngineConfig {
     fn default() -> Self {
@@ -203,6 +212,7 @@ impl Default for SyncEngineConfig {
             cdc_stream_maxlen: default_cdc_stream_maxlen(),
             redis_timeout_ms: default_redis_timeout_ms(),
             redis_response_timeout_ms: default_redis_response_timeout_ms(),
+            sql_write_concurrency: default_sql_write_concurrency(),
         }
     }
 }

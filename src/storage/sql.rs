@@ -86,6 +86,16 @@ impl SqlStore {
         }
         
         store.init_schema().await?;
+        
+        // MySQL: Set session-level transaction isolation to READ COMMITTED
+        // This reduces gap locking and deadlocks under high concurrency
+        if !is_sqlite {
+            sqlx::query("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                .execute(&store.pool)
+                .await
+                .map_err(|e| StorageError::Backend(format!("Failed to set MySQL isolation level: {}", e)))?;
+        }
+        
         Ok(store)
     }
     

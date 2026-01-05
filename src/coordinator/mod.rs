@@ -54,7 +54,7 @@ use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::time::Instant;
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{watch, Mutex, Semaphore};
 use tracing::{info, warn, debug, error};
 
 use crate::config::SyncEngineConfig;
@@ -145,6 +145,12 @@ pub struct SyncEngine {
 
     /// Search state (index manager + cache)
     pub(super) search_state: Option<Arc<RwLock<SearchState>>>,
+
+    /// SQL write concurrency limiter
+    /// 
+    /// Limits concurrent sql_put_batch and merkle_nodes updates to reduce
+    /// row-level lock contention and deadlocks under high load.
+    pub(super) sql_write_semaphore: Arc<Semaphore>,
 }
 
 impl SyncEngine {
@@ -160,6 +166,9 @@ impl SyncEngine {
             flush_count: config.batch_flush_count,
             flush_bytes: config.batch_flush_bytes,
         };
+
+        // SQL write concurrency limiter - reduces row lock contention
+        let sql_write_semaphore = Arc::new(Semaphore::new(config.sql_write_concurrency));
 
         Self {
             config: RwLock::new(config.clone()),
@@ -183,6 +192,7 @@ impl SyncEngine {
             mysql_health: MysqlHealthChecker::new(),
             eviction_policy: TanCurvePolicy::default(),
             search_state: Some(Arc::new(RwLock::new(SearchState::default()))),
+            sql_write_semaphore,
         }
     }
 
