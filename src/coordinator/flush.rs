@@ -148,20 +148,37 @@ impl SyncEngine {
     /// Items are grouped by their `OptionsKey` so that:
     /// - All items with same options go in one Redis pipeline
     /// - All items with same options go in one SQL batch INSERT
+    ///
+    /// **Deduplication**: Under high concurrency, the same `object_id` may appear
+    /// multiple times in a batch window. We deduplicate by `object_id`, keeping
+    /// the latest version (last occurrence). This prevents:
+    /// - SQL deadlocks from `INSERT ... ON DUPLICATE KEY UPDATE` on same rows
+    /// - Verification mismatches from counting duplicates vs distinct rows
     pub(super) async fn flush_batch_internal(&self, batch: FlushBatch<SyncItem>) {
         let flush_start = std::time::Instant::now();
         let batch_size = batch.items.len();
         debug!(batch_size = batch_size, reason = ?batch.reason, "Flushing batch");
         
-        // ====== Group items by compatible options ======
-        let mut groups: HashMap<OptionsKey, Vec<SyncItem>> = HashMap::new();
+        // ====== Group items by compatible options, deduplicate by object_id ======
+        // Using HashMap<object_id, SyncItem> ensures each object_id appears once.
+        // Later items overwrite earlier ones, keeping the latest version.
+        let mut groups: HashMap<OptionsKey, HashMap<String, SyncItem>> = HashMap::new();
         for item in batch.items {
             let key = OptionsKey::from(&item.effective_options());
-            groups.entry(key).or_default().push(item);
+            // .insert() replaces existing, keeping the latest version from the batch
+            groups.entry(key).or_default().insert(item.object_id.clone(), item);
         }
         
         let group_count = groups.len();
-        debug!(group_count, "Grouped items by options");
+        let deduped_total: usize = groups.values().map(|g| g.len()).sum();
+        if deduped_total < batch_size {
+            debug!(
+                original = batch_size,
+                deduped = deduped_total,
+                "Deduplicated batch (same object_id updated multiple times)"
+            );
+        }
+        debug!(group_count, items = deduped_total, "Grouped items by options");
         
         // ====== Flush each group ======
         let mut total_l2_success = 0;
@@ -171,7 +188,9 @@ impl SyncEngine {
         let mut total_l3_bytes = 0usize;
         let mut total_wal_fallback = 0;
         
-        for (options_key, mut items) in groups {
+        for (options_key, items_map) in groups {
+            // Convert HashMap to Vec for downstream processing
+            let mut items: Vec<SyncItem> = items_map.into_values().collect();
             let options = options_key.to_options();
             let group_size = items.len();
             let group_bytes: usize = items.iter().map(|i| i.content.len()).sum();
