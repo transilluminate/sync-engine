@@ -379,6 +379,43 @@ impl SyncEngine {
         })
     }
 
+    /// Submit a batch of materialized views.
+    ///
+    /// Uses a dedicated queue to avoid contention with the main batcher.
+    /// Views are flushed independently by the sync engine loop.
+    pub async fn submit_view_batch(&self, items: Vec<SyncItem>) -> Result<BatchResult, StorageError> {
+        if !self.should_accept_writes() {
+            return Err(StorageError::Backend(format!(
+                "Rejecting view batch: engine state={}, pressure={}",
+                self.state(),
+                self.pressure()
+            )));
+        }
+        
+        let total = items.len();
+        
+        // Update L1 cache immediately
+        for item in &items {
+            self.insert_l1(item.clone());
+        }
+        
+        // Send to dedicated queue
+        match self.view_queue_tx.send(items).await {
+            Ok(_) => {
+                debug!(total, "View batch submitted to queue");
+                Ok(BatchResult {
+                    total,
+                    succeeded: total,
+                    failed: 0,
+                })
+            },
+            Err(_) => {
+                error!("View queue closed");
+                Err(StorageError::Backend("View queue closed".to_string()))
+            }
+        }
+    }
+
     /// Delete multiple items atomically.
     ///
     /// Removes items from all tiers (L1, L2, L3) and updates filters.

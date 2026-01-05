@@ -233,7 +233,7 @@ impl RedisMerkleStore {
             }
         }
         
-        let mut children: BTreeMap<String, [u8; 32]> = BTreeMap::new();
+        let mut direct_children: Vec<(String, String)> = Vec::new(); // (segment, full_key)
         
         for key in &keys {
             // Extract the path from the key
@@ -253,15 +253,37 @@ impl RedisMerkleStore {
             if let Some(segment) = suffix.split('.').next() {
                 // Only if segment IS the whole suffix (no more dots)
                 if segment == suffix || !suffix.contains('.') {
-                    // This is a direct child - but we need the full child path
-                    let child_path = if prefix.is_empty() {
-                        segment.to_string()
-                    } else {
-                        format!("{}.{}", prefix, segment)
-                    };
-                    
-                    if let Some(hash) = self.get_hash(&child_path).await? {
-                        children.insert(segment.to_string(), hash);
+                    direct_children.push((segment.to_string(), key.clone()));
+                }
+            }
+        }
+
+        if direct_children.is_empty() {
+            // No children, this might be a leaf or deleted node
+            return Ok(());
+        }
+
+        // Batch fetch hashes (MGET)
+        let mut children: BTreeMap<String, [u8; 32]> = BTreeMap::new();
+        
+        // Redis MGET is O(n) - chunk to avoid blocking the server too long
+        const MGET_CHUNK_SIZE: usize = 1000;
+        for chunk in direct_children.chunks(MGET_CHUNK_SIZE) {
+            let keys: Vec<String> = chunk.iter().map(|(_, k)| k.clone()).collect();
+            let segments: Vec<String> = chunk.iter().map(|(s, _)| s.clone()).collect();
+            
+            let hex_hashes: Vec<Option<String>> = conn.mget(&keys).await.map_err(|e| {
+                StorageError::Backend(format!("Failed to batch get merkle hashes: {}", e))
+            })?;
+            
+            for (i, maybe_hex) in hex_hashes.into_iter().enumerate() {
+                if let Some(hex_str) = maybe_hex {
+                    if let Ok(bytes) = hex::decode(&hex_str) {
+                        if bytes.len() == 32 {
+                            let mut hash = [0u8; 32];
+                            hash.copy_from_slice(&bytes);
+                            children.insert(segments[i].clone(), hash);
+                        }
                     }
                 }
             }

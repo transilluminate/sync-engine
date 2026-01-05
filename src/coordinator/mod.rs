@@ -54,7 +54,7 @@ use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::time::Instant;
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use tokio::sync::{watch, Mutex, Semaphore};
+use tokio::sync::{watch, Mutex, Semaphore, mpsc};
 use tracing::{info, warn, debug, error};
 
 use crate::config::SyncEngineConfig;
@@ -146,11 +146,23 @@ pub struct SyncEngine {
     /// Search state (index manager + cache)
     pub(super) search_state: Option<Arc<RwLock<SearchState>>>,
 
-    /// SQL write concurrency limiter
+    /// SQL write concurrency limiter.
     /// 
     /// Limits concurrent sql_put_batch and merkle_nodes updates to reduce
     /// row-level lock contention and deadlocks under high load.
     pub(super) sql_write_semaphore: Arc<Semaphore>,
+
+    /// View submission queue sender.
+    ///
+    /// Dedicated channel for [`submit_view_batch()`](Self::submit_view_batch) to avoid
+    /// contention with the main batcher. Views (compacted CRDT state) are typically
+    /// larger and less frequent than deltas.
+    pub(super) view_queue_tx: mpsc::Sender<Vec<SyncItem>>,
+    
+    /// View submission queue receiver.
+    ///
+    /// Drained by [`maybe_flush_views()`] in the main loop.
+    pub(super) view_queue_rx: Mutex<mpsc::Receiver<Vec<SyncItem>>>,
 }
 
 impl SyncEngine {
@@ -169,6 +181,11 @@ impl SyncEngine {
 
         // SQL write concurrency limiter - reduces row lock contention
         let sql_write_semaphore = Arc::new(Semaphore::new(config.sql_write_concurrency));
+
+        // View submission queue - dedicated channel for view materialization.
+        // Buffer size allows for burst without blocking callers.
+        const VIEW_QUEUE_BUFFER_SIZE: usize = 100;
+        let (view_queue_tx, view_queue_rx) = mpsc::channel(VIEW_QUEUE_BUFFER_SIZE);
 
         Self {
             config: RwLock::new(config.clone()),
@@ -193,6 +210,8 @@ impl SyncEngine {
             eviction_policy: TanCurvePolicy::default(),
             search_state: Some(Arc::new(RwLock::new(SearchState::default()))),
             sql_write_semaphore,
+            view_queue_tx,
+            view_queue_rx: Mutex::new(view_queue_rx),
         }
     }
 

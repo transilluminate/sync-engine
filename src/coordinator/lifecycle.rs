@@ -490,6 +490,7 @@ impl SyncEngine {
                 _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
                     self.maybe_evict();
                     self.maybe_flush_l2().await;
+                    self.maybe_flush_views().await;
                     self.maybe_snapshot_cf_by_threshold().await;
                 }
                 

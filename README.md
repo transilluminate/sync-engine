@@ -73,7 +73,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sync-engine = "0.2.13"
+sync-engine = "0.2.14"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
@@ -194,6 +194,29 @@ engine.delete_prefix("delta:user.123:").await?;
 ```
 
 Prefix scan queries SQL directly (ground truth) and leverages the primary key index for efficient `LIKE 'prefix%'` queries.
+
+## High-Throughput View Batching
+
+For CRDT view materialization or other high-frequency state updates, use the dedicated view queue to avoid contention with the main sync batcher:
+
+```rust
+use sync_engine::{SyncItem, BatchResult};
+use serde_json::json;
+
+// After compacting deltas into final state, submit via the dedicated view queue
+let materialized = SyncItem::from_json(
+    "user.123".into(),
+    json!({"name": "Alice", "score": 42})
+).with_state("base");
+
+// submit_view_batch bypasses the main batcher for lower latency
+let result: BatchResult = engine.submit_view_batch(vec![materialized]).await?;
+```
+
+The view queue processes up to 5 batches per tick on a dedicated channel, ideal for:
+- CRDT view materialization after delta compaction  
+- High-frequency state snapshots
+- Aggregate updates that shouldn't compete with real-time sync
 
 ## Full-Text Search
 
@@ -348,6 +371,10 @@ All configuration options with their defaults:
 | **CDC Stream** |||
 | `enable_cdc_stream` | `false` | Enable Change Data Capture to Redis Stream |
 | `cdc_stream_maxlen` | `100000` | Max stream entries (MAXLEN ~, relies on Merkle repair) |
+| **Timeouts & Concurrency** |||
+| `redis_timeout_ms` | `5000` | Redis command timeout (increase under high load) |
+| `redis_response_timeout_ms` | `5000` | Redis response timeout after command sent |
+| `sql_write_concurrency` | `4` | Max concurrent SQL writes (reduces deadlocks) |
 
 ## Testing
 

@@ -1749,13 +1749,33 @@ async fn cdc_stream_put_entries() {
     
     assert_eq!(entries.len(), 2, "Should have 2 CDC entries");
     
-    // Parse first entry and verify fields
+    // Collect all keys from entries (order is non-deterministic due to HashMap deduplication)
+    let mut found_keys: Vec<String> = Vec::new();
+    for entry in &entries {
+        if let redis::Value::Array(entry_arr) = entry {
+            if let redis::Value::Array(fields) = &entry_arr[1] {
+                for i in (0..fields.len()).step_by(2) {
+                    if let (redis::Value::BulkString(field), redis::Value::BulkString(value)) = (&fields[i], &fields[i+1]) {
+                        let field_str = String::from_utf8_lossy(field);
+                        if field_str == "key" {
+                            found_keys.push(String::from_utf8_lossy(value).to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Verify both keys are present (order doesn't matter)
+    assert!(found_keys.contains(&"cdc.test.1".to_string()), "CDC should contain cdc.test.1");
+    assert!(found_keys.contains(&"cdc.test.2".to_string()), "CDC should contain cdc.test.2");
+    
+    // Verify first entry has correct structure (op=PUT)
     if let redis::Value::Array(entry) = &entries[0] {
         // entry = [id, [field, value, field, value, ...]]
         if let redis::Value::Array(fields) = &entry[1] {
             // Find "op" field
             let mut op_found = false;
-            let mut key_found = false;
             for i in (0..fields.len()).step_by(2) {
                 if let (redis::Value::BulkString(field), redis::Value::BulkString(value)) = (&fields[i], &fields[i+1]) {
                     let field_str = String::from_utf8_lossy(field);
@@ -1764,14 +1784,9 @@ async fn cdc_stream_put_entries() {
                         assert_eq!(value_str, "PUT");
                         op_found = true;
                     }
-                    if field_str == "key" {
-                        assert_eq!(value_str, "cdc.test.1");
-                        key_found = true;
-                    }
                 }
             }
             assert!(op_found, "CDC entry should have 'op' field");
-            assert!(key_found, "CDC entry should have 'key' field");
         }
     }
 
