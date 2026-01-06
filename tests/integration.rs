@@ -1211,7 +1211,7 @@ async fn coverage_merkle_with_prefix() {
     // Apply a batch
     use sync_engine::merkle::{MerkleBatch, PathMerkle};
     let mut batch = MerkleBatch::new();
-    let hash = PathMerkle::leaf_hash("user.test", 1, 12345, &[0u8; 32]);
+    let hash = PathMerkle::leaf_hash("user.test", 1, &[0u8; 32]);
     batch.insert("user.test".to_string(), hash);
     
     merkle.apply_batch(&batch).await.expect("Apply batch failed");

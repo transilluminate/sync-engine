@@ -330,6 +330,7 @@ impl ArchiveStore for SqlStore {
         };
 
         let sql = if self.is_sqlite {
+            // Only mark merkle_dirty if payload actually changed (content-addressed)
             "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty, state, access_count, last_accessed) 
              VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?) 
              ON CONFLICT(id) DO UPDATE SET 
@@ -339,11 +340,12 @@ impl ArchiveStore for SqlStore {
                 payload = excluded.payload, 
                 payload_blob = excluded.payload_blob, 
                 audit = excluded.audit, 
-                merkle_dirty = 1, 
+                merkle_dirty = CASE WHEN sync_items.payload_hash IS DISTINCT FROM excluded.payload_hash THEN 1 ELSE sync_items.merkle_dirty END, 
                 state = excluded.state,
                 access_count = excluded.access_count,
                 last_accessed = excluded.last_accessed"
         } else {
+            // MySQL version: only mark merkle_dirty if payload_hash changed
             "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty, state, access_count, last_accessed) 
              VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?) 
              ON DUPLICATE KEY UPDATE 
@@ -353,7 +355,7 @@ impl ArchiveStore for SqlStore {
                 payload = VALUES(payload), 
                 payload_blob = VALUES(payload_blob), 
                 audit = VALUES(audit), 
-                merkle_dirty = 1, 
+                merkle_dirty = CASE WHEN payload_hash != VALUES(payload_hash) OR payload_hash IS NULL THEN 1 ELSE merkle_dirty END, 
                 state = VALUES(state),
                 access_count = VALUES(access_count),
                 last_accessed = VALUES(last_accessed)"
@@ -504,7 +506,7 @@ impl SqlStore {
                     payload = excluded.payload, \
                     payload_blob = excluded.payload_blob, \
                     audit = excluded.audit, \
-                    merkle_dirty = 1, \
+                    merkle_dirty = CASE WHEN sync_items.payload_hash IS DISTINCT FROM excluded.payload_hash THEN 1 ELSE sync_items.merkle_dirty END, \
                     state = excluded.state, \
                     access_count = excluded.access_count, \
                     last_accessed = excluded.last_accessed",
@@ -520,7 +522,7 @@ impl SqlStore {
                     payload = VALUES(payload), \
                     payload_blob = VALUES(payload_blob), \
                     audit = VALUES(audit), \
-                    merkle_dirty = 1, \
+                    merkle_dirty = CASE WHEN payload_hash != VALUES(payload_hash) OR payload_hash IS NULL THEN 1 ELSE merkle_dirty END, \
                     state = VALUES(state), \
                     access_count = VALUES(access_count), \
                     last_accessed = VALUES(last_accessed)",

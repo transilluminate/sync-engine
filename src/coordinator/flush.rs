@@ -353,7 +353,6 @@ impl SyncEngine {
                     let leaf_hash = PathMerkle::leaf_hash(
                         &item.object_id,
                         item.version,
-                        item.updated_at,
                         &payload_hash,
                     );
                     merkle_batch.insert(item.object_id.clone(), leaf_hash);

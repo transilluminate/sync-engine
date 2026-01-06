@@ -441,8 +441,19 @@ impl SyncEngine {
                         if self.memory_pressure() < 1.0 {
                             self.insert_l1(item.clone());
                         }
+                        
+                        // Also populate L2 (read-through cache)
+                        if let Some(ref l2) = self.l2_store {
+                            if let Err(e) = l2.put(&item).await {
+                                warn!(id = %id, error = %e, "Failed to populate L2 on read");
+                            } else {
+                                debug!("L3 hit, promoted to L1 and L2");
+                            }
+                        } else {
+                            debug!("L3 hit, promoted to L1");
+                        }
+                        
                         tracing::Span::current().record("tier", "L3");
-                        debug!("L3 hit, promoted to L1");
                         crate::metrics::record_operation("L3", "get", "hit");
                         crate::metrics::record_latency("L3", "get", start.elapsed());
                         crate::metrics::record_bytes_read("L3", item.content.len());

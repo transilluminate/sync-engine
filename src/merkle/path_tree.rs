@@ -128,20 +128,21 @@ impl PathMerkle {
 
     /// Compute the leaf hash for a sync item.
     ///
-    /// Hash = SHA256(object_id || version || timestamp || payload_hash)
+    /// Hash = SHA256(object_id || version || payload_hash)
+    /// 
+    /// Note: We intentionally exclude timestamp to ensure idempotent updates.
+    /// Two writes with identical content should produce the same Merkle root,
+    /// regardless of when they occurred. This prevents false sync conflicts.
     #[instrument(skip(payload_hash))]
     pub fn leaf_hash(
         object_id: &str,
         version: u64,
-        timestamp: i64,
         payload_hash: &[u8; 32],
     ) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(object_id.as_bytes());
         hasher.update(b"|");
         hasher.update(version.to_le_bytes());
-        hasher.update(b"|");
-        hasher.update(timestamp.to_le_bytes());
         hasher.update(b"|");
         hasher.update(payload_hash);
         hasher.finalize().into()

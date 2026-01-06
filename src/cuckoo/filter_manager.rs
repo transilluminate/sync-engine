@@ -126,8 +126,14 @@ impl FilterManager {
     }
 
     /// Insert a key into the filter (call when item is persisted to L3).
+    ///
+    /// This is treated as an idempotent operation: if the key already exists
+    /// (or a false positive match exists), we do nothing. This prevents
+    /// filter explosion on repeated updates to the same key.
     pub fn insert(&self, key: &str) {
-        self.filter.insert(key);
+        if !self.filter.contains(key) {
+            self.filter.insert(key);
+        }
     }
 
     /// Remove a key from the filter (call when item is deleted from L3).
@@ -140,7 +146,9 @@ impl FilterManager {
     /// More efficient than individual inserts for large batches.
     pub fn bulk_insert(&self, keys: &[String]) {
         for key in keys {
-            self.filter.insert(key.as_str());
+            if !self.filter.contains(key) {
+                self.filter.insert(key.as_str());
+            }
         }
         debug!(
             added = keys.len(),
@@ -399,8 +407,9 @@ mod tests {
             fm.insert(&format!("key-{}", i));
         }
         
-        // Should have grown
-        assert_eq!(fm.len(), 100);
+        // Should have grown (some may be skipped due to false positives in contains check)
+        // Cuckoo filters have a small false positive rate (~3%), so we expect at least 95
+        assert!(fm.len() >= 95, "Expected at least 95 entries, got {}", fm.len());
         
         // Capacity should be >= entries
         let (count, capacity, _) = fm.stats();
