@@ -310,6 +310,110 @@ impl SyncEngine {
         
         Ok(divergent_leaves)
     }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Branch Hygiene API: For safe comparison during active writes
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Count dirty items within a branch prefix.
+    ///
+    /// Returns 0 if the branch is "clean" (all merkle hashes up-to-date),
+    /// meaning it's safe to compare with peers without churn concerns.
+    ///
+    /// # Arguments
+    /// * `prefix` - Branch prefix (e.g., "uk.nhs" matches "uk.nhs.patient.123")
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # async fn example(engine: &sync_engine::SyncEngine) {
+    /// let dirty = engine.branch_dirty_count("uk.nhs").await.unwrap();
+    /// if dirty == 0 {
+    ///     // Safe to compare this branch with peer
+    /// }
+    /// # }
+    /// ```
+    #[instrument(skip(self))]
+    pub async fn branch_dirty_count(&self, prefix: &str) -> Result<u64, StorageError> {
+        if let Some(ref sql_store) = self.sql_store {
+            return sql_store.branch_dirty_count(prefix).await;
+        }
+        // No SQL store means no ground truth - assume clean
+        Ok(0)
+    }
+    
+    /// Get top-level prefixes that have dirty items pending merkle recalc.
+    ///
+    /// Branches NOT in this list are "clean" and safe to compare with peers.
+    /// Use this for opportunistic branch sync - sync what's stable, skip what's churning.
+    ///
+    /// # Returns
+    /// List of dirty top-level prefixes (e.g., ["uk", "us"] if those have pending writes)
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # async fn example(engine: &sync_engine::SyncEngine) {
+    /// let dirty_branches = engine.get_dirty_prefixes().await.unwrap();
+    /// let all_branches = engine.get_top_level_branches().await.unwrap();
+    /// 
+    /// for (branch, hash) in all_branches {
+    ///     if !dirty_branches.contains(&branch) {
+    ///         // This branch is clean - safe to compare with peer
+    ///     }
+    /// }
+    /// # }
+    /// ```
+    #[instrument(skip(self))]
+    pub async fn get_dirty_prefixes(&self) -> Result<Vec<String>, StorageError> {
+        if let Some(ref sql_store) = self.sql_store {
+            return sql_store.get_dirty_prefixes().await;
+        }
+        Ok(Vec::new())
+    }
+    
+    /// Get top-level branches with their hashes.
+    ///
+    /// Returns children of the root node - the first level of the merkle tree.
+    /// Combine with [`get_dirty_prefixes()`] to find clean branches for comparison.
+    #[instrument(skip(self))]
+    pub async fn get_top_level_branches(&self) -> Result<BTreeMap<String, [u8; 32]>, StorageError> {
+        self.get_merkle_children("").await
+    }
+    
+    /// Get clean branches with their hashes.
+    ///
+    /// Convenience method that returns only branches that are fully up-to-date
+    /// (no pending merkle recalculations). These are safe to compare with peers.
+    #[instrument(skip(self))]
+    pub async fn get_clean_branches(&self) -> Result<BTreeMap<String, [u8; 32]>, StorageError> {
+        let all_branches = self.get_top_level_branches().await?;
+        let dirty_prefixes = self.get_dirty_prefixes().await?;
+        
+        let clean: BTreeMap<String, [u8; 32]> = all_branches
+            .into_iter()
+            .filter(|(branch, _)| !dirty_prefixes.contains(branch))
+            .collect();
+        
+        debug!(
+            total = clean.len() + dirty_prefixes.len(),
+            clean = clean.len(),
+            dirty = dirty_prefixes.len(),
+            "Branch hygiene check"
+        );
+        
+        Ok(clean)
+    }
+    
+    /// Check if the entire merkle tree is clean (no pending recalculations).
+    ///
+    /// Returns `true` only when all items have `merkle_dirty = 0`.
+    /// This is stricter than [`is_merkle_synced()`] which only compares roots.
+    #[instrument(skip(self))]
+    pub async fn is_fully_clean(&self) -> Result<bool, StorageError> {
+        if let Some(ref sql_store) = self.sql_store {
+            return sql_store.has_dirty_merkle().await.map(|has_dirty| !has_dirty);
+        }
+        Ok(true)
+    }
 }
 
 #[cfg(test)]

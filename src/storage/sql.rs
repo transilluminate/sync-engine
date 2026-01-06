@@ -839,6 +839,61 @@ impl SqlStore {
         Ok(result.is_some())
     }
     
+    /// Count dirty merkle items within a specific branch prefix.
+    ///
+    /// Used for branch-level hygiene checks. Returns 0 if the branch is "clean"
+    /// (all merkle hashes up-to-date), allowing safe comparison with peers.
+    ///
+    /// # Arguments
+    /// * `prefix` - Branch prefix (e.g., "uk.nhs" matches "uk.nhs.patient.123")
+    pub async fn branch_dirty_count(&self, prefix: &str) -> Result<u64, StorageError> {
+        let pattern = format!("{}%", prefix);
+        let result = sqlx::query(
+            "SELECT COUNT(*) as cnt FROM sync_items WHERE id LIKE ? AND merkle_dirty = 1"
+        )
+            .bind(&pattern)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        
+        let count: i64 = result.try_get("cnt")
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        
+        Ok(count as u64)
+    }
+    
+    /// Get distinct top-level prefixes that have dirty items.
+    ///
+    /// Returns prefixes like ["uk", "us", "de"] that have pending merkle recalcs.
+    /// Branches NOT in this list are "clean" and safe to compare with peers.
+    pub async fn get_dirty_prefixes(&self) -> Result<Vec<String>, StorageError> {
+        // Extract first segment before '.' for items with merkle_dirty = 1
+        let sql = if self.is_sqlite {
+            // SQLite: use substr and instr
+            "SELECT DISTINCT CASE 
+                WHEN instr(id, '.') > 0 THEN substr(id, 1, instr(id, '.') - 1)
+                ELSE id 
+            END as prefix FROM sync_items WHERE merkle_dirty = 1"
+        } else {
+            // MySQL: use SUBSTRING_INDEX
+            "SELECT DISTINCT SUBSTRING_INDEX(id, '.', 1) as prefix FROM sync_items WHERE merkle_dirty = 1"
+        };
+        
+        let rows = sqlx::query(sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        
+        let mut prefixes = Vec::with_capacity(rows.len());
+        for row in rows {
+            let prefix: String = row.try_get("prefix")
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            prefixes.push(prefix);
+        }
+        
+        Ok(prefixes)
+    }
+
     /// Get full SyncItems with merkle_dirty = 1 (need merkle recalculation).
     ///
     /// Returns the items themselves so merkle can be calculated.
