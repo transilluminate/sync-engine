@@ -127,7 +127,7 @@ pub struct SyncEngineConfig {
     
     /// CDC Stream: Enable Change Data Capture output to Redis Stream.
     /// 
-    /// When enabled, every Put/Delete writes to `{redis_prefix}__local__:cdc`.
+    /// When enabled, every Put/Delete writes to `{redis_prefix}:cdc`.
     /// This enables external replication agents to tail changes.
     /// Default: false (opt-in feature)
     #[serde(default)]

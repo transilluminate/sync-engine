@@ -73,7 +73,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sync-engine = "0.2.14"
+sync-engine = "0.2.16"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
@@ -194,29 +194,6 @@ engine.delete_prefix("delta:user.123:").await?;
 ```
 
 Prefix scan queries SQL directly (ground truth) and leverages the primary key index for efficient `LIKE 'prefix%'` queries.
-
-## High-Throughput View Batching
-
-For CRDT view materialization or other high-frequency state updates, use the dedicated view queue to avoid contention with the main sync batcher:
-
-```rust
-use sync_engine::{SyncItem, BatchResult};
-use serde_json::json;
-
-// After compacting deltas into final state, submit via the dedicated view queue
-let materialized = SyncItem::from_json(
-    "user.123".into(),
-    json!({"name": "Alice", "score": 42})
-).with_state("base");
-
-// submit_view_batch bypasses the main batcher for lower latency
-let result: BatchResult = engine.submit_view_batch(vec![materialized]).await?;
-```
-
-The view queue processes up to 5 batches per tick on a dedicated channel, ideal for:
-- CRDT view materialization after delta compaction  
-- High-frequency state snapshots
-- Aggregate updates that shouldn't compete with real-time sync
 
 ## Full-Text Search
 

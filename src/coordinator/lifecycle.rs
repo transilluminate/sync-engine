@@ -481,7 +481,9 @@ impl SyncEngine {
             
             if config_changed {
                 let new_config = self.config_rx.lock().await.borrow_and_update().clone();
-                info!("Config updated: l1_max_bytes={}", new_config.l1_max_bytes);
+                info!("Config hot-reloaded: l1_max_bytes={}, redis_url={:?}", 
+                    new_config.l1_max_bytes,
+                    new_config.redis_url.as_ref().map(|u| u.rsplit('@').next().unwrap_or(u)));
                 *self.config.write() = new_config;
             }
             
@@ -489,7 +491,6 @@ impl SyncEngine {
                 _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
                     self.maybe_evict();
                     self.maybe_flush_l2().await;
-                    self.maybe_flush_views().await;
                     self.maybe_snapshot_cf_by_threshold().await;
                 }
                 
@@ -512,7 +513,7 @@ impl SyncEngine {
     #[tracing::instrument(skip(self))]
     pub async fn shutdown(&self) {
         use crate::FlushReason;
-        
+
         let shutdown_start = std::time::Instant::now();
         info!("Initiating sync engine shutdown...");
         let _ = self.state.send(EngineState::ShuttingDown);

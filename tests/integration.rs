@@ -1736,9 +1736,9 @@ async fn cdc_stream_put_entries() {
     let client = redis::Client::open(format!("redis://127.0.0.1:{}", redis_port)).unwrap();
     let mut conn = redis::aio::ConnectionManager::new(client).await.unwrap();
     
-    // XRANGE __local__:cdc - + COUNT 10
+    // XRANGE :cdc - + COUNT 10
     let entries: Vec<redis::Value> = redis::cmd("XRANGE")
-        .arg("__local__:cdc")
+        .arg("cdc")
         .arg("-")
         .arg("+")
         .arg("COUNT")
@@ -1834,7 +1834,7 @@ async fn cdc_stream_delete_entries() {
     let mut conn = redis::aio::ConnectionManager::new(client).await.unwrap();
     
     let entries: Vec<redis::Value> = redis::cmd("XRANGE")
-        .arg("__local__:cdc")
+        .arg("cdc")
         .arg("-")
         .arg("+")
         .arg("COUNT")
@@ -1902,7 +1902,7 @@ async fn cdc_stream_disabled_no_entries() {
     let mut conn = redis::aio::ConnectionManager::new(client).await.unwrap();
     
     let exists: bool = redis::cmd("EXISTS")
-        .arg("__local__:cdc")
+        .arg(":cdc")
         .query_async(&mut conn)
         .await
         .expect("EXISTS failed");
@@ -1945,13 +1945,13 @@ async fn cdc_stream_respects_prefix() {
     engine.force_flush().await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // CDC stream should be at myapp:__local__:cdc
+    // CDC stream should be at myapp:cdc
     let client = redis::Client::open(format!("redis://127.0.0.1:{}", redis_port)).unwrap();
     let mut conn = redis::aio::ConnectionManager::new(client).await.unwrap();
     
     // Prefixed stream should exist
     let prefixed_exists: bool = redis::cmd("EXISTS")
-        .arg("myapp:__local__:cdc")
+        .arg("myapp:cdc")
         .query_async(&mut conn)
         .await
         .expect("EXISTS failed");
@@ -1959,7 +1959,7 @@ async fn cdc_stream_respects_prefix() {
     
     // Unprefixed stream should NOT exist
     let unprefixed_exists: bool = redis::cmd("EXISTS")
-        .arg("__local__:cdc")
+        .arg(":cdc")
         .query_async(&mut conn)
         .await
         .expect("EXISTS failed");

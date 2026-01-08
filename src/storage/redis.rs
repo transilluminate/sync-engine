@@ -880,7 +880,7 @@ impl RedisStore {
     /// Write a CDC entry to the stream.
     /// 
     /// Uses XADD with MAXLEN ~ for bounded stream size.
-    /// The stream key is `{prefix}__local__:cdc`.
+    /// The stream key is `{prefix}:cdc`.
     pub async fn xadd_cdc(
         &self, 
         entry: &crate::cdc::CdcEntry, 

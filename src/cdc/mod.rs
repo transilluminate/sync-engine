@@ -4,14 +4,14 @@
 //! Change Data Capture (CDC) Stream support.
 //!
 //! Emits mutations to a Redis Stream for external replication agents.
-//! The stream key is `{redis_prefix}__local__:cdc` where `__local__` indicates
-//! node-local infrastructure that should not be replicated itself.
+//! The stream key is `{redis_prefix}:cdc` - each node writes to its own stream.
+//! Replication agents tail remote peers' CDC streams to replicate changes.
 //!
 //! # Stream Format
 //!
 //! ## PUT operation
 //! ```text
-//! XADD {prefix}__local__:cdc MAXLEN ~ 100000 *
+//! XADD {prefix}:cdc MAXLEN ~ 100000 *
 //!   op    "PUT"
 //!   key   "uk.nhs.patient.12345"
 //!   hash  "a1b2c3..."                # content_hash for dedup
@@ -21,7 +21,7 @@
 //!
 //! ## DELETE operation
 //! ```text
-//! XADD {prefix}__local__:cdc MAXLEN ~ 100000 *
+//! XADD {prefix}:cdc MAXLEN ~ 100000 *
 //!   op    "DEL"
 //!   key   "uk.nhs.patient.12345"
 //! ```
@@ -37,8 +37,10 @@ use std::io::Read;
 /// zstd magic bytes: 0x28 0xB5 0x2F 0xFD
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
-/// CDC stream suffix (appended to redis_prefix)
-pub const CDC_STREAM_SUFFIX: &str = "__local__:cdc";
+/// CDC stream key suffix (appended to redis_prefix).
+/// Convention: redis_prefix includes trailing colon (e.g., "redsqrl:").
+/// Result: "redsqrl:cdc" or just "cdc" if no prefix.
+pub const CDC_STREAM_SUFFIX: &str = "cdc";
 
 /// CDC operation type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,9 +301,12 @@ mod tests {
 
     #[test]
     fn test_cdc_stream_key() {
-        assert_eq!(cdc_stream_key(None), "__local__:cdc");
-        assert_eq!(cdc_stream_key(Some("myapp:")), "myapp:__local__:cdc");
-        assert_eq!(cdc_stream_key(Some("")), "__local__:cdc");
+        // No prefix -> just "cdc"
+        assert_eq!(cdc_stream_key(None), "cdc");
+        // Prefix with trailing colon -> "myapp:cdc"
+        assert_eq!(cdc_stream_key(Some("myapp:")), "myapp:cdc");
+        // Empty prefix -> just "cdc"
+        assert_eq!(cdc_stream_key(Some("")), "cdc");
     }
 
     #[test]

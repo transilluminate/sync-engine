@@ -16,7 +16,7 @@ use crate::storage::traits::StorageError;
 use crate::sync_item::SyncItem;
 use crate::submit_options::OptionsKey;
 use crate::merkle::{MerkleBatch, PathMerkle};
-use crate::batching::hybrid_batcher::{FlushBatch, FlushReason};
+use crate::batching::hybrid_batcher::FlushBatch;
 use crate::cuckoo::L3_FILTER_ID;
 
 use super::{SyncEngine, WriteTarget};
@@ -140,37 +140,6 @@ impl SyncEngine {
         
         if let Some(batch) = batch {
             self.flush_batch_internal(batch).await;
-        }
-    }
-
-    /// Maximum view batches to flush per tick.
-    /// Limits work per iteration to avoid starving the main event loop.
-    const VIEW_BATCHES_PER_TICK: usize = 5;
-
-    /// Flush pending view batches from the dedicated queue.
-    ///
-    /// Drains up to [`VIEW_BATCHES_PER_TICK`] batches per call to avoid
-    /// blocking the main loop for too long.
-    pub(super) async fn maybe_flush_views(&self) {
-        let mut rx = self.view_queue_rx.lock().await;
-        
-        let mut count = 0;
-        while count < Self::VIEW_BATCHES_PER_TICK {
-            match rx.try_recv() {
-                Ok(items) => {
-                    if !items.is_empty() {
-                        let total_bytes = items.iter().map(|i| i.content.len()).sum();
-                        let batch = FlushBatch {
-                            items,
-                            total_bytes,
-                            reason: FlushReason::ViewQueue,
-                        };
-                        self.flush_batch_internal(batch).await;
-                    }
-                    count += 1;
-                },
-                Err(_) => break,
-            }
         }
     }
 

@@ -46,8 +46,6 @@ pub enum FlushReason {
     Manual,
     /// Shutdown flush
     Shutdown,
-    /// View queue flush
-    ViewQueue,
 }
 
 /// Configuration for hybrid batching
