@@ -130,6 +130,7 @@ pub mod coordinator;
 pub mod metrics;
 pub mod search;
 pub mod cdc;
+pub mod schema;
 
 // Note: We don't expose a `tracing` module to avoid conflict with the tracing crate
 
@@ -147,3 +148,4 @@ pub use resilience::circuit_breaker::{CircuitBreaker, CircuitConfig, CircuitErro
 pub use resilience::retry::RetryConfig;
 pub use metrics::LatencyTimer;
 pub use cdc::{CdcEntry, CdcOp, CdcMeta, CdcFieldValue, maybe_compress, maybe_decompress, is_zstd_compressed, cdc_stream_key, CDC_STREAM_SUFFIX};
+pub use schema::{SchemaRegistry, DEFAULT_TABLE};

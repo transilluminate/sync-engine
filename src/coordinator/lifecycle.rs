@@ -86,7 +86,8 @@ impl SyncEngine {
         let sql_url = self.config.read().sql_url.clone();
         if let Some(ref sql_url) = sql_url {
             info!(url = %sql_url, "Connecting to SQL (L3 - ground truth)...");
-            match crate::storage::sql::SqlStore::new(sql_url).await {
+            // Pass shared schema registry to SqlStore for table routing
+            match crate::storage::sql::SqlStore::with_registry(sql_url, self.schema_registry.clone()).await {
                 Ok(store) => {
                     // Initialize SQL merkle store (ground truth) - shares pool with SqlStore
                     let is_sqlite = sql_url.starts_with("sqlite:");

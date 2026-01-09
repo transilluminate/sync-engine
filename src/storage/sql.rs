@@ -56,17 +56,38 @@ fn install_drivers() {
     });
 }
 
+use std::sync::Arc;
+use crate::schema::SchemaRegistry;
+
 pub struct SqlStore {
     pool: AnyPool,
     is_sqlite: bool,
+    /// Schema registry for table routing.
+    /// Shared with SyncEngine for dynamic registration.
+    registry: Arc<SchemaRegistry>,
 }
 
 impl SqlStore {
     /// Create a new SQL store with startup-mode retry (fails fast if config is wrong).
     pub async fn new(connection_string: &str) -> Result<Self, StorageError> {
+        Self::with_registry(connection_string, Arc::new(SchemaRegistry::new())).await
+    }
+    
+    /// Create a new SQL store with a shared schema registry.
+    ///
+    /// Use this when you want the SyncEngine to share the registry
+    /// for dynamic schema registration.
+    pub async fn with_registry(connection_string: &str, registry: Arc<SchemaRegistry>) -> Result<Self, StorageError> {
         install_drivers();
         
         let is_sqlite = connection_string.starts_with("sqlite:");
+        
+        // For SQLite, use bypass mode (no partitioning benefit)
+        let registry = if is_sqlite && !registry.is_bypass() {
+            Arc::new(SchemaRegistry::bypass())
+        } else {
+            registry
+        };
         
         let pool = retry("sql_connect", &RetryConfig::startup(), || async {
             AnyPoolOptions::new()
@@ -79,7 +100,7 @@ impl SqlStore {
         })
         .await?;
 
-        let store = Self { pool, is_sqlite };
+        let store = Self { pool, is_sqlite, registry };
         
         // Enable WAL mode for SQLite (better concurrency, faster writes)
         if is_sqlite {
@@ -103,6 +124,12 @@ impl SqlStore {
     /// Get a clone of the connection pool for sharing with other stores.
     pub fn pool(&self) -> AnyPool {
         self.pool.clone()
+    }
+    
+    /// Get the schema registry for this store.
+    #[must_use]
+    pub fn registry(&self) -> &Arc<SchemaRegistry> {
+        &self.registry
     }
     
     /// Enable WAL (Write-Ahead Logging) mode for SQLite.
@@ -187,6 +214,110 @@ impl SqlStore {
         Ok(())
     }
     
+    /// Create a schema-specific table with the same structure as sync_items.
+    ///
+    /// Used for horizontal partitioning: each schema (e.g., "users", "orders")
+    /// gets its own table with identical DDL. This enables:
+    /// - Better query performance (smaller tables, focused indices)
+    /// - Easier maintenance (vacuum, backup per-schema)
+    /// - Future sharding potential
+    ///
+    /// For SQLite, this is a no-op (returns Ok) since partitioning doesn't help.
+    ///
+    /// # Arguments
+    /// * `table_name` - Name of the table to create (e.g., "users_items")
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # use sync_engine::storage::sql::SqlStore;
+    /// # async fn example(store: &SqlStore) {
+    /// store.ensure_table("users_items").await.unwrap();
+    /// store.ensure_table("orders_items").await.unwrap();
+    /// # }
+    /// ```
+    pub async fn ensure_table(&self, table_name: &str) -> Result<(), StorageError> {
+        // SQLite: skip partitioning - no benefit for embedded use
+        if self.is_sqlite {
+            return Ok(());
+        }
+        
+        // Validate table name to prevent SQL injection
+        // Only allow alphanumeric and underscore
+        if !table_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Err(StorageError::Backend(format!(
+                "Invalid table name '{}': only alphanumeric and underscore allowed",
+                table_name
+            )));
+        }
+        
+        // Don't recreate the default table
+        if table_name == crate::schema::DEFAULT_TABLE {
+            return Ok(());
+        }
+        
+        // MySQL table DDL - identical structure to sync_items
+        let sql = format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS {} (
+                id VARCHAR(255) PRIMARY KEY,
+                version BIGINT NOT NULL DEFAULT 1,
+                timestamp BIGINT NOT NULL,
+                payload_hash VARCHAR(64),
+                payload LONGTEXT,
+                payload_blob MEDIUMBLOB,
+                audit TEXT,
+                merkle_dirty TINYINT NOT NULL DEFAULT 1,
+                state VARCHAR(32) NOT NULL DEFAULT 'default',
+                access_count BIGINT NOT NULL DEFAULT 0,
+                last_accessed BIGINT NOT NULL DEFAULT 0,
+                INDEX idx_{}_timestamp (timestamp),
+                INDEX idx_{}_merkle_dirty (merkle_dirty),
+                INDEX idx_{}_state (state)
+            )
+            "#,
+            table_name, table_name, table_name, table_name
+        );
+
+        retry("sql_ensure_table", &RetryConfig::startup(), || async {
+            sqlx::query(&sql)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| StorageError::Backend(e.to_string()))
+        })
+        .await?;
+        
+        tracing::info!(table = %table_name, "Created schema table");
+
+        Ok(())
+    }
+    
+    /// Check if a table exists.
+    pub async fn table_exists(&self, table_name: &str) -> Result<bool, StorageError> {
+        if self.is_sqlite {
+            let sql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?";
+            let result = sqlx::query(sql)
+                .bind(table_name)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            Ok(result.is_some())
+        } else {
+            let sql = "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_NAME = ?";
+            let result = sqlx::query(sql)
+                .bind(table_name)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            Ok(result.is_some())
+        }
+    }
+    
+    /// Check if this is a SQLite database.
+    #[must_use]
+    pub fn is_sqlite(&self) -> bool {
+        self.is_sqlite
+    }
+    
     /// Build the audit JSON object for operational metadata.
     fn build_audit_json(item: &SyncItem) -> Option<String> {
         let mut audit = serde_json::Map::new();
@@ -230,11 +361,14 @@ impl SqlStore {
 impl ArchiveStore for SqlStore {
     async fn get(&self, id: &str) -> Result<Option<SyncItem>, StorageError> {
         let id = id.to_string();
+        let table = self.registry.table_for_key(&id);
         
         retry("sql_get", &RetryConfig::query(), || async {
-            let result = sqlx::query(
-                "SELECT version, timestamp, payload_hash, payload, payload_blob, audit, state, access_count, last_accessed FROM sync_items WHERE id = ?"
-            )
+            let sql = format!(
+                "SELECT version, timestamp, payload_hash, payload, payload_blob, audit, state, access_count, last_accessed FROM {} WHERE id = ?",
+                table
+            );
+            let result = sqlx::query(&sql)
                 .bind(&id)
                 .fetch_optional(&self.pool)
                 .await
@@ -313,6 +447,7 @@ impl ArchiveStore for SqlStore {
 
     async fn put(&self, item: &SyncItem) -> Result<(), StorageError> {
         let id = item.object_id.clone();
+        let table = self.registry.table_for_key(&id);
         let version = item.version as i64;
         let timestamp = item.updated_at;
         let payload_hash = if item.content_hash.is_empty() { None } else { Some(item.content_hash.clone()) };
@@ -332,38 +467,44 @@ impl ArchiveStore for SqlStore {
 
         let sql = if self.is_sqlite {
             // Only mark merkle_dirty if payload actually changed (content-addressed)
-            "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty, state, access_count, last_accessed) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?) 
-             ON CONFLICT(id) DO UPDATE SET 
-                version = excluded.version, 
-                timestamp = excluded.timestamp, 
-                payload_hash = excluded.payload_hash, 
-                payload = excluded.payload, 
-                payload_blob = excluded.payload_blob, 
-                audit = excluded.audit, 
-                merkle_dirty = CASE WHEN sync_items.payload_hash IS DISTINCT FROM excluded.payload_hash THEN 1 ELSE sync_items.merkle_dirty END, 
-                state = excluded.state,
-                access_count = excluded.access_count,
-                last_accessed = excluded.last_accessed"
+            format!(
+                "INSERT INTO {} (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty, state, access_count, last_accessed) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?) 
+                 ON CONFLICT(id) DO UPDATE SET 
+                    version = excluded.version, 
+                    timestamp = excluded.timestamp, 
+                    payload_hash = excluded.payload_hash, 
+                    payload = excluded.payload, 
+                    payload_blob = excluded.payload_blob, 
+                    audit = excluded.audit, 
+                    merkle_dirty = CASE WHEN {}.payload_hash IS DISTINCT FROM excluded.payload_hash THEN 1 ELSE {}.merkle_dirty END, 
+                    state = excluded.state,
+                    access_count = excluded.access_count,
+                    last_accessed = excluded.last_accessed",
+                table, table, table
+            )
         } else {
             // MySQL version: only mark merkle_dirty if payload_hash changed
-            "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty, state, access_count, last_accessed) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?) 
-             ON DUPLICATE KEY UPDATE 
-                version = VALUES(version), 
-                timestamp = VALUES(timestamp), 
-                payload_hash = VALUES(payload_hash), 
-                payload = VALUES(payload), 
-                payload_blob = VALUES(payload_blob), 
-                audit = VALUES(audit), 
-                merkle_dirty = CASE WHEN payload_hash != VALUES(payload_hash) OR payload_hash IS NULL THEN 1 ELSE merkle_dirty END, 
-                state = VALUES(state),
-                access_count = VALUES(access_count),
-                last_accessed = VALUES(last_accessed)"
+            format!(
+                "INSERT INTO {} (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty, state, access_count, last_accessed) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?) 
+                 ON DUPLICATE KEY UPDATE 
+                    version = VALUES(version), 
+                    timestamp = VALUES(timestamp), 
+                    payload_hash = VALUES(payload_hash), 
+                    payload = VALUES(payload), 
+                    payload_blob = VALUES(payload_blob), 
+                    audit = VALUES(audit), 
+                    merkle_dirty = CASE WHEN payload_hash != VALUES(payload_hash) OR payload_hash IS NULL THEN 1 ELSE merkle_dirty END, 
+                    state = VALUES(state),
+                    access_count = VALUES(access_count),
+                    last_accessed = VALUES(last_accessed)",
+                table
+            )
         };
 
         retry("sql_put", &RetryConfig::query(), || async {
-            sqlx::query(sql)
+            sqlx::query(&sql)
                 .bind(&id)
                 .bind(version)
                 .bind(timestamp)
@@ -384,8 +525,10 @@ impl ArchiveStore for SqlStore {
 
     async fn delete(&self, id: &str) -> Result<(), StorageError> {
         let id = id.to_string();
+        let table = self.registry.table_for_key(&id);
         retry("sql_delete", &RetryConfig::query(), || async {
-            sqlx::query("DELETE FROM sync_items WHERE id = ?")
+            let sql = format!("DELETE FROM {} WHERE id = ?", table);
+            sqlx::query(&sql)
                 .bind(&id)
                 .execute(&self.pool)
                 .await
@@ -397,8 +540,10 @@ impl ArchiveStore for SqlStore {
 
     async fn exists(&self, id: &str) -> Result<bool, StorageError> {
         let id = id.to_string();
+        let table = self.registry.table_for_key(&id);
         retry("sql_exists", &RetryConfig::query(), || async {
-            let result = sqlx::query("SELECT 1 FROM sync_items WHERE id = ? LIMIT 1")
+            let sql = format!("SELECT 1 FROM {} WHERE id = ? LIMIT 1", table);
+            let result = sqlx::query(&sql)
                 .bind(&id)
                 .fetch_optional(&self.pool)
                 .await
@@ -409,6 +554,9 @@ impl ArchiveStore for SqlStore {
     }
     
     /// Write a batch of items in a single multi-row INSERT with verification.
+    /// 
+    /// Items are grouped by target table (based on schema registry) and written
+    /// in separate batches per table.
     async fn put_batch(&self, items: &mut [SyncItem]) -> Result<BatchWriteResult, StorageError> {
         if items.is_empty() {
             return Ok(BatchWriteResult {
@@ -429,13 +577,23 @@ impl ArchiveStore for SqlStore {
         // Collect IDs for verification
         let item_ids: Vec<String> = items.iter().map(|i| i.object_id.clone()).collect();
 
+        // Group items by target table
+        let mut by_table: std::collections::HashMap<&'static str, Vec<&SyncItem>> = std::collections::HashMap::new();
+        for item in items.iter() {
+            let table = self.registry.table_for_key(&item.object_id);
+            by_table.entry(table).or_default().push(item);
+        }
+
         // MySQL max_allowed_packet is typically 16MB, so chunk into ~500 item batches
         const CHUNK_SIZE: usize = 500;
         let mut total_written = 0usize;
 
-        for chunk in items.chunks(CHUNK_SIZE) {
-            let written = self.put_batch_chunk(chunk, &batch_id).await?;
-            total_written += written;
+        // Write each table's items
+        for (table, table_items) in by_table {
+            for chunk in table_items.chunks(CHUNK_SIZE) {
+                let written = self.put_batch_chunk_to_table(table, chunk, &batch_id).await?;
+                total_written += written;
+            }
         }
 
         // Verify ALL items exist (not by batch_id - that's unreliable under concurrency)
@@ -549,16 +707,16 @@ impl ArchiveStore for SqlStore {
 }
 
 impl SqlStore {
-    /// Write a single chunk of items with content-type aware storage.
+    /// Write a single chunk of items to a specific table with content-type aware storage.
     /// The batch_id is already embedded in each item's audit JSON.
-    async fn put_batch_chunk(&self, chunk: &[SyncItem], _batch_id: &str) -> Result<usize, StorageError> {
+    async fn put_batch_chunk_to_table(&self, table: &str, chunk: &[&SyncItem], _batch_id: &str) -> Result<usize, StorageError> {
         let placeholders: Vec<String> = (0..chunk.len())
             .map(|_| "(?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)".to_string())
             .collect();
         
         let sql = if self.is_sqlite {
             format!(
-                "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty, state, access_count, last_accessed) VALUES {} \
+                "INSERT INTO {} (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty, state, access_count, last_accessed) VALUES {} \
                  ON CONFLICT(id) DO UPDATE SET \
                     version = excluded.version, \
                     timestamp = excluded.timestamp, \
@@ -566,15 +724,15 @@ impl SqlStore {
                     payload = excluded.payload, \
                     payload_blob = excluded.payload_blob, \
                     audit = excluded.audit, \
-                    merkle_dirty = CASE WHEN sync_items.payload_hash IS DISTINCT FROM excluded.payload_hash THEN 1 ELSE sync_items.merkle_dirty END, \
+                    merkle_dirty = CASE WHEN {}.payload_hash IS DISTINCT FROM excluded.payload_hash THEN 1 ELSE {}.merkle_dirty END, \
                     state = excluded.state, \
                     access_count = excluded.access_count, \
                     last_accessed = excluded.last_accessed",
-                placeholders.join(", ")
+                table, placeholders.join(", "), table, table
             )
         } else {
             format!(
-                "INSERT INTO sync_items (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty, state, access_count, last_accessed) VALUES {} \
+                "INSERT INTO {} (id, version, timestamp, payload_hash, payload, payload_blob, audit, merkle_dirty, state, access_count, last_accessed) VALUES {} \
                  ON DUPLICATE KEY UPDATE \
                     version = VALUES(version), \
                     timestamp = VALUES(timestamp), \
@@ -586,7 +744,7 @@ impl SqlStore {
                     state = VALUES(state), \
                     access_count = VALUES(access_count), \
                     last_accessed = VALUES(last_accessed)",
-                placeholders.join(", ")
+                table, placeholders.join(", ")
             )
         };
 
@@ -666,36 +824,46 @@ impl SqlStore {
 
     /// Verify a batch was written by checking all IDs exist.
     /// This is more reliable than batch_id verification under concurrent writes.
+    /// Groups IDs by table for proper routing.
     async fn verify_batch_ids(&self, ids: &[String]) -> Result<usize, StorageError> {
         if ids.is_empty() {
             return Ok(0);
+        }
+
+        // Group IDs by table
+        let mut by_table: std::collections::HashMap<&'static str, Vec<&String>> = std::collections::HashMap::new();
+        for id in ids {
+            let table = self.registry.table_for_key(id);
+            by_table.entry(table).or_default().push(id);
         }
 
         // Use chunked EXISTS queries to avoid overly large IN clauses
         const CHUNK_SIZE: usize = 500;
         let mut total_found = 0usize;
 
-        for chunk in ids.chunks(CHUNK_SIZE) {
-            let placeholders: Vec<&str> = (0..chunk.len()).map(|_| "?").collect();
-            let sql = format!(
-                "SELECT COUNT(*) as cnt FROM sync_items WHERE id IN ({})",
-                placeholders.join(", ")
-            );
+        for (table, table_ids) in by_table {
+            for chunk in table_ids.chunks(CHUNK_SIZE) {
+                let placeholders: Vec<&str> = (0..chunk.len()).map(|_| "?").collect();
+                let sql = format!(
+                    "SELECT COUNT(*) as cnt FROM {} WHERE id IN ({})",
+                    table, placeholders.join(", ")
+                );
 
-            let mut query = sqlx::query(&sql);
-            for id in chunk {
-                query = query.bind(id);
+                let mut query = sqlx::query(&sql);
+                for id in chunk {
+                    query = query.bind(*id);
+                }
+
+                let result = query
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|e| StorageError::Backend(e.to_string()))?;
+
+                let count: i64 = result
+                    .try_get("cnt")
+                    .map_err(|e| StorageError::Backend(e.to_string()))?;
+                total_found += count as usize;
             }
-
-            let result = query
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| StorageError::Backend(e.to_string()))?;
-
-            let count: i64 = result
-                .try_get("cnt")
-                .map_err(|e| StorageError::Backend(e.to_string()))?;
-            total_found += count as usize;
         }
 
         Ok(total_found)

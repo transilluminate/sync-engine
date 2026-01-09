@@ -42,6 +42,7 @@ mod lifecycle;
 mod flush;
 mod merkle_api;
 mod search_api;
+mod schema_api;
 
 pub use types::{EngineState, ItemStatus, BatchResult, HealthCheck};
 pub use merkle_api::MerkleDiff;
@@ -69,6 +70,7 @@ use crate::batching::hybrid_batcher::{HybridBatcher, BatchConfig, SizedItem};
 use crate::merkle::{RedisMerkleStore, SqlMerkleStore, MerkleBatch};
 use crate::resilience::wal::{WriteAheadLog, MysqlHealthChecker};
 use crate::eviction::tan_curve::{TanCurvePolicy, CacheEntry};
+use crate::schema::SchemaRegistry;
 
 use search_api::SearchState;
 
@@ -151,6 +153,12 @@ pub struct SyncEngine {
     /// Limits concurrent sql_put_batch and merkle_nodes updates to reduce
     /// row-level lock contention and deadlocks under high load.
     pub(super) sql_write_semaphore: Arc<Semaphore>,
+
+    /// Schema registry for table routing.
+    ///
+    /// Maps key prefixes to separate SQL tables for horizontal scaling.
+    /// Shared with SqlStore for consistent routing.
+    pub(super) schema_registry: Arc<SchemaRegistry>,
 }
 
 impl SyncEngine {
@@ -169,6 +177,9 @@ impl SyncEngine {
 
         // SQL write concurrency limiter - reduces row lock contention
         let sql_write_semaphore = Arc::new(Semaphore::new(config.sql_write_concurrency));
+
+        // Schema registry for table routing (starts empty, populated via register_schema)
+        let schema_registry = Arc::new(SchemaRegistry::new());
 
         Self {
             config: RwLock::new(config.clone()),
@@ -193,6 +204,7 @@ impl SyncEngine {
             eviction_policy: TanCurvePolicy::default(),
             search_state: Some(Arc::new(RwLock::new(SearchState::default()))),
             sql_write_semaphore,
+            schema_registry,
         }
     }
 

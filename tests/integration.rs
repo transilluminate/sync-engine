@@ -1968,3 +1968,181 @@ async fn cdc_stream_respects_prefix() {
     engine.shutdown().await;
     cleanup_wal_files(&wal_path);
 }
+
+// =============================================================================
+// Schema-Based Table Partitioning Tests
+// =============================================================================
+
+#[tokio::test]
+#[ignore] // Requires Docker (MySQL)
+async fn schema_routing_creates_tables() {
+    let docker = Cli::default();
+    let mysql = mysql_container(&docker);
+    let mysql_port = mysql.get_host_port_ipv4(3306);
+    
+    // Give MySQL time to fully initialize
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    
+    let wal_path = unique_wal_path("schema_routing");
+    let config = SyncEngineConfig {
+        redis_url: None,
+        sql_url: Some(format!(
+            "mysql://test:test@127.0.0.1:{}/test", mysql_port
+        )),
+        l1_max_bytes: 10 * 1024 * 1024,
+        wal_path: Some(wal_path.clone()),
+        ..Default::default()
+    };
+
+    let (_tx, rx) = watch::channel(config.clone());
+    let mut engine = SyncEngine::new(config, rx);
+    engine.start().await.expect("Failed to start engine");
+    
+    // Register a schema - should create users_items table
+    engine.register_schema("users", "view:users:").await
+        .expect("Failed to register schema");
+    engine.register_schema("users", "crdt:users:").await
+        .expect("Failed to register second prefix");
+    
+    // Verify routing works
+    assert_eq!(engine.table_for_key("view:users:alice"), "users_items");
+    assert_eq!(engine.table_for_key("crdt:users:bob"), "users_items");
+    assert_eq!(engine.table_for_key("unknown:key"), "sync_items");
+    
+    // Verify tables list
+    let tables = engine.registered_tables();
+    assert!(tables.contains(&"users_items".to_string()));
+    
+    // Verify prefixes for table
+    let prefixes = engine.prefixes_for_table("users_items");
+    assert_eq!(prefixes.len(), 2);
+    assert!(prefixes.contains(&"view:users:".to_string()));
+    assert!(prefixes.contains(&"crdt:users:".to_string()));
+    
+    engine.shutdown().await;
+    cleanup_wal_files(&wal_path);
+}
+
+#[tokio::test]
+#[ignore] // Requires Docker (MySQL)
+async fn schema_routing_writes_to_correct_table() {
+    let docker = Cli::default();
+    let mysql = mysql_container(&docker);
+    let mysql_port = mysql.get_host_port_ipv4(3306);
+    
+    // Give MySQL time to fully initialize
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    
+    let wal_path = unique_wal_path("schema_writes");
+    let config = SyncEngineConfig {
+        redis_url: None,
+        sql_url: Some(format!(
+            "mysql://test:test@127.0.0.1:{}/test", mysql_port
+        )),
+        l1_max_bytes: 10 * 1024 * 1024,
+        wal_path: Some(wal_path.clone()),
+        batch_flush_count: 5,  // Small batch for fast flush
+        batch_flush_ms: 10,
+        ..Default::default()
+    };
+
+    let (_tx, rx) = watch::channel(config.clone());
+    let mut engine = SyncEngine::new(config, rx);
+    engine.start().await.expect("Failed to start engine");
+    
+    // Register users schema
+    engine.register_schema("users", "view:users:").await
+        .expect("Failed to register schema");
+    
+    // Submit items to both tables
+    let user_item = SyncItem::from_json(
+        "view:users:alice".into(),
+        json!({"name": "Alice"})
+    );
+    let default_item = SyncItem::from_json(
+        "other:thing:123".into(),
+        json!({"type": "other"})
+    );
+    
+    engine.submit(user_item).await.expect("Submit user failed");
+    engine.submit(default_item).await.expect("Submit default failed");
+    
+    // Force flush
+    engine.force_flush().await;
+    
+    // Verify items can be retrieved
+    let retrieved_user = engine.get("view:users:alice").await
+        .expect("Get user failed");
+    assert!(retrieved_user.is_some());
+    assert_eq!(retrieved_user.unwrap().object_id, "view:users:alice");
+    
+    let retrieved_default = engine.get("other:thing:123").await
+        .expect("Get default failed");
+    assert!(retrieved_default.is_some());
+    assert_eq!(retrieved_default.unwrap().object_id, "other:thing:123");
+    
+    engine.shutdown().await;
+    cleanup_wal_files(&wal_path);
+}
+
+#[tokio::test]
+#[ignore] // Requires Docker (MySQL)  
+async fn schema_routing_batch_spans_tables() {
+    let docker = Cli::default();
+    let mysql = mysql_container(&docker);
+    let mysql_port = mysql.get_host_port_ipv4(3306);
+    
+    // Give MySQL time to fully initialize
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    
+    let wal_path = unique_wal_path("schema_batch");
+    let config = SyncEngineConfig {
+        redis_url: None,
+        sql_url: Some(format!(
+            "mysql://test:test@127.0.0.1:{}/test", mysql_port
+        )),
+        l1_max_bytes: 10 * 1024 * 1024,
+        wal_path: Some(wal_path.clone()),
+        batch_flush_count: 100,  // Larger batch to test grouping
+        batch_flush_ms: 10,
+        ..Default::default()
+    };
+
+    let (_tx, rx) = watch::channel(config.clone());
+    let mut engine = SyncEngine::new(config, rx);
+    engine.start().await.expect("Failed to start engine");
+    
+    // Register two schemas
+    engine.register_schema("users", "view:users:").await.unwrap();
+    engine.register_schema("orders", "view:orders:").await.unwrap();
+    
+    // Submit a batch spanning 3 tables (users, orders, default)
+    let items = vec![
+        SyncItem::from_json("view:users:alice".into(), json!({"name": "Alice"})),
+        SyncItem::from_json("view:users:bob".into(), json!({"name": "Bob"})),
+        SyncItem::from_json("view:orders:001".into(), json!({"total": 100})),
+        SyncItem::from_json("view:orders:002".into(), json!({"total": 200})),
+        SyncItem::from_json("misc:item:xyz".into(), json!({"misc": true})),
+    ];
+    
+    let result = engine.submit_many(items).await.expect("Batch submit failed");
+    assert_eq!(result.succeeded, 5);
+    
+    // Force flush
+    engine.force_flush().await;
+    
+    // Verify all items are retrievable
+    assert!(engine.get("view:users:alice").await.unwrap().is_some());
+    assert!(engine.get("view:users:bob").await.unwrap().is_some());
+    assert!(engine.get("view:orders:001").await.unwrap().is_some());
+    assert!(engine.get("view:orders:002").await.unwrap().is_some());
+    assert!(engine.get("misc:item:xyz").await.unwrap().is_some());
+    
+    // Verify routing
+    assert_eq!(engine.table_for_key("view:users:alice"), "users_items");
+    assert_eq!(engine.table_for_key("view:orders:001"), "orders_items");
+    assert_eq!(engine.table_for_key("misc:item:xyz"), "sync_items");
+    
+    engine.shutdown().await;
+    cleanup_wal_files(&wal_path);
+}
