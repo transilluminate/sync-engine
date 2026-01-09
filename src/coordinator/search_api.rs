@@ -29,7 +29,7 @@ use tracing::{debug, info};
 use crate::metrics;
 use crate::search::{
     IndexManager, SearchIndex, SearchCache, SearchCacheStats,
-    Query, RediSearchTranslator, SqlTranslator,
+    Query, RediSearchTranslator, SqlTranslator, SqlParam,
 };
 use crate::sync_item::SyncItem;
 use crate::storage::traits::StorageError;
@@ -160,6 +160,24 @@ impl SyncEngine {
         }
     }
 
+    /// Get the view prefix for a search index.
+    ///
+    /// Returns the prefix used for view: keys in SQL (e.g., "view:test:user:").
+    /// This is needed for SQL search filtering to only search materialized views.
+    pub fn get_index_view_prefix(&self, index_name: &str) -> String {
+        let crdt_prefix = if let Some(ref search_state) = self.search_state {
+            search_state.read()
+                .index_manager
+                .get(index_name)
+                .map(|idx| idx.prefix.clone())
+        } else {
+            None
+        };
+
+        let crdt_prefix = crdt_prefix.unwrap_or_else(|| format!("crdt:{}:", index_name));
+        crdt_prefix.replace("crdt:", "view:")
+    }
+
     /// Search for items using RediSearch query syntax.
     ///
     /// Searches the specified index using FT.SEARCH. For durable data (crdt: prefix),
@@ -177,6 +195,7 @@ impl SyncEngine {
     /// # async fn example(engine: &SyncEngine) -> Result<(), Box<dyn std::error::Error>> {
     /// // Simple field query
     /// let results = engine.search("users", &Query::field_eq("name", "Alice")).await?;
+    ///
     ///
     /// // Complex query with AND/OR
     /// let query = Query::field_eq("status", "active")
@@ -265,7 +284,9 @@ impl SyncEngine {
                 // Empty or error - try SQL fallback for durable tier
                 if tier == SearchTier::RedisWithSqlFallback {
                     let sql_start = Instant::now();
-                    let sql_results = self.search_sql(query, limit).await?;
+                    // Use view: prefix for SQL search (views have the materialized data)
+                    let view_prefix = prefix.replace("crdt:", "view:");
+                    let sql_results = self.search_sql_with_prefix(query, &view_prefix, limit).await?;
                     let is_empty = sql_results.is_empty();
                     
                     metrics::record_search_query("sql", "success");
@@ -369,6 +390,19 @@ impl SyncEngine {
         query: &Query,
         limit: usize,
     ) -> Result<Vec<SyncItem>, StorageError> {
+        self.search_sql_with_prefix(query, "", limit).await
+    }
+
+    /// Search SQL with a key prefix filter.
+    ///
+    /// Only items whose `id` starts with the given prefix will be searched.
+    /// This is essential for multi-schema tables where views and crdt items coexist.
+    pub async fn search_sql_with_prefix(
+        &self,
+        query: &Query,
+        key_prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<SyncItem>, StorageError> {
         let l3 = self.l3_store.as_ref().ok_or_else(|| {
             StorageError::Connection("SQL not available".into())
         })?;
@@ -376,16 +410,64 @@ impl SyncEngine {
         metrics::record_search_query("sql_direct", "attempt");
         let start = std::time::Instant::now();
 
-        let sql_query = SqlTranslator::translate(query, "data");
-        debug!(clause = %sql_query.clause, "SQL search");
+        let sql_query = SqlTranslator::translate(query, "payload");
+        
+        // Combine prefix filter with query clause
+        let (full_clause, full_params) = if key_prefix.is_empty() {
+            (sql_query.clause.clone(), sql_query.params.clone())
+        } else {
+            // Add prefix filter: id LIKE 'prefix%' AND (original query)
+            let mut params = vec![SqlParam::Text(format!("{}%", key_prefix))];
+            params.extend(sql_query.params.clone());
+            (format!("id LIKE ? AND ({})", sql_query.clause), params)
+        };
+        
+        debug!(clause = %full_clause, prefix = %key_prefix, "SQL search");
 
-        let results = l3.search(&sql_query.clause, &sql_query.params, limit).await?;
+        let results = l3.search(&full_clause, &full_params, limit).await?;
         
         metrics::record_search_query("sql_direct", "success");
         metrics::record_search_latency("sql_direct", start.elapsed());
         metrics::record_search_results(results.len());
         
         Ok(results)
+    }
+
+    /// Count items matching a query in SQL (fast COUNT(*) without fetching data).
+    ///
+    /// Use this for exhaustiveness checks: compare Redis result count with SQL total.
+    /// This is much faster than fetching all results just to count them.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let redis_results = engine.search("users", &query).await?;
+    /// let sql_count = engine.search_count_sql(&query).await?;
+    /// let exhaustive = redis_results.items.len() as u64 == sql_count;
+    /// ```
+    pub async fn search_count_sql(&self, query: &Query) -> Result<u64, StorageError> {
+        self.search_count_sql_with_prefix(query, "").await
+    }
+
+    /// Count items matching a query in SQL with a key prefix filter.
+    pub async fn search_count_sql_with_prefix(&self, query: &Query, key_prefix: &str) -> Result<u64, StorageError> {
+        let l3 = self.l3_store.as_ref().ok_or_else(|| {
+            StorageError::Connection("SQL not available".into())
+        })?;
+
+        let sql_query = SqlTranslator::translate(query, "payload");
+        
+        // Combine prefix filter with query clause
+        let (full_clause, full_params) = if key_prefix.is_empty() {
+            (sql_query.clause.clone(), sql_query.params.clone())
+        } else {
+            let mut params = vec![SqlParam::Text(format!("{}%", key_prefix))];
+            params.extend(sql_query.params.clone());
+            (format!("id LIKE ? AND ({})", sql_query.clause), params)
+        };
+        
+        debug!(clause = %full_clause, prefix = %key_prefix, "SQL count");
+
+        l3.count_where(&full_clause, &full_params).await
     }
 
     /// Get search cache statistics.

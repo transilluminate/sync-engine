@@ -41,6 +41,7 @@
 use async_trait::async_trait;
 use sqlx::{AnyPool, Row, any::AnyPoolOptions};
 use crate::sync_item::{SyncItem, ContentType};
+use crate::search::SqlParam;
 use super::traits::{ArchiveStore, BatchWriteResult, StorageError};
 use crate::resilience::retry::{retry, RetryConfig};
 use std::sync::Once;
@@ -478,6 +479,65 @@ impl ArchiveStore for SqlStore {
     async fn count_all(&self) -> Result<u64, StorageError> {
         let result = sqlx::query("SELECT COUNT(*) as cnt FROM sync_items")
             .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        
+        let count: i64 = result.try_get("cnt")
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        
+        Ok(count as u64)
+    }
+
+    async fn search(&self, where_clause: &str, params: &[SqlParam], limit: usize) -> Result<Vec<SyncItem>, StorageError> {
+        use sqlx::Row;
+        
+        let sql = format!(
+            "SELECT id, version, timestamp, payload_hash, payload, payload_blob, audit, state, access_count, last_accessed \
+             FROM sync_items WHERE {} LIMIT {}",
+            where_clause, limit
+        );
+        
+        let mut query = sqlx::query(&sql);
+        for param in params {
+            query = match param {
+                SqlParam::Text(s) => query.bind(s.clone()),
+                SqlParam::Numeric(f) => query.bind(*f),
+                SqlParam::Boolean(b) => query.bind(*b),
+            };
+        }
+        
+        let rows = query.fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get("id")
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            
+            // Reuse the get() parsing logic by fetching each item
+            // This is slightly inefficient but ensures consistent parsing
+            if let Some(item) = self.get(&id).await? {
+                items.push(item);
+            }
+        }
+        
+        Ok(items)
+    }
+
+    async fn count_where(&self, where_clause: &str, params: &[SqlParam]) -> Result<u64, StorageError> {
+        let sql = format!("SELECT COUNT(*) as cnt FROM sync_items WHERE {}", where_clause);
+        
+        let mut query = sqlx::query(&sql);
+        for param in params {
+            query = match param {
+                SqlParam::Text(s) => query.bind(s.clone()),
+                SqlParam::Numeric(f) => query.bind(*f),
+                SqlParam::Boolean(b) => query.bind(*b),
+            };
+        }
+        
+        let result = query.fetch_one(&self.pool)
             .await
             .map_err(|e| StorageError::Backend(e.to_string()))?;
         

@@ -203,11 +203,16 @@ impl SqlTranslator {
 
     fn json_path(field: &str) -> String {
         // Support dot notation for nested fields
-        // e.g., "user.name" -> "$.user.name"
+        // Views are stored as {"data": {...}, "meta": {...}}
+        // So field "score" -> "$.data.score"
         if field.starts_with('$') {
             field.to_string()
-        } else {
+        } else if field.starts_with("meta.") {
+            // Meta fields (updated_at, version) are at $.meta.X
             format!("$.{}", field)
+        } else {
+            // Data fields are nested under $.data
+            format!("$.data.{}", field)
         }
     }
 }
@@ -219,23 +224,23 @@ mod tests {
     #[test]
     fn test_simple_field_query() {
         let query = Query::field_eq("name", "Alice");
-        let sql = SqlTranslator::translate(&query, "data");
-        assert_eq!(sql.clause, "JSON_UNQUOTE(JSON_EXTRACT(data, '$.name')) = ?");
+        let sql = SqlTranslator::translate(&query, "payload");
+        assert_eq!(sql.clause, "JSON_UNQUOTE(JSON_EXTRACT(payload, '$.data.name')) = ?");
         assert_eq!(sql.params, vec![SqlParam::Text("Alice".to_string())]);
     }
 
     #[test]
     fn test_inline_simple_field() {
         let query = Query::field_eq("name", "Alice");
-        let sql = SqlTranslator::translate_inline(&query, "data");
-        assert_eq!(sql, "JSON_UNQUOTE(JSON_EXTRACT(data, '$.name')) = 'Alice'");
+        let sql = SqlTranslator::translate_inline(&query, "payload");
+        assert_eq!(sql, "JSON_UNQUOTE(JSON_EXTRACT(payload, '$.data.name')) = 'Alice'");
     }
 
     #[test]
     fn test_numeric_range() {
         let query = Query::numeric_range("age", Some(25.0), Some(40.0));
-        let sql = SqlTranslator::translate(&query, "data");
-        assert_eq!(sql.clause, "JSON_EXTRACT(data, '$.age') BETWEEN ? AND ?");
+        let sql = SqlTranslator::translate(&query, "payload");
+        assert_eq!(sql.clause, "JSON_EXTRACT(payload, '$.data.age') BETWEEN ? AND ?");
         assert_eq!(
             sql.params,
             vec![SqlParam::Numeric(25.0), SqlParam::Numeric(40.0)]
@@ -245,26 +250,26 @@ mod tests {
     #[test]
     fn test_numeric_range_unbounded_min() {
         let query = Query::numeric_range("age", None, Some(40.0));
-        let sql = SqlTranslator::translate(&query, "data");
-        assert_eq!(sql.clause, "JSON_EXTRACT(data, '$.age') <= ?");
+        let sql = SqlTranslator::translate(&query, "payload");
+        assert_eq!(sql.clause, "JSON_EXTRACT(payload, '$.data.age') <= ?");
         assert_eq!(sql.params, vec![SqlParam::Numeric(40.0)]);
     }
 
     #[test]
     fn test_numeric_range_unbounded_max() {
         let query = Query::numeric_range("score", Some(100.0), None);
-        let sql = SqlTranslator::translate(&query, "data");
-        assert_eq!(sql.clause, "JSON_EXTRACT(data, '$.score') >= ?");
+        let sql = SqlTranslator::translate(&query, "payload");
+        assert_eq!(sql.clause, "JSON_EXTRACT(payload, '$.data.score') >= ?");
         assert_eq!(sql.params, vec![SqlParam::Numeric(100.0)]);
     }
 
     #[test]
     fn test_tag_query() {
         let query = Query::tags("tags", vec!["rust".to_string(), "database".to_string()]);
-        let sql = SqlTranslator::translate(&query, "data");
+        let sql = SqlTranslator::translate(&query, "payload");
         assert_eq!(
             sql.clause,
-            "(JSON_CONTAINS(data->'$.tags', ?) OR JSON_CONTAINS(data->'$.tags', ?))"
+            "(JSON_CONTAINS(payload->'$.data.tags', ?) OR JSON_CONTAINS(payload->'$.data.tags', ?))"
         );
         assert_eq!(
             sql.params,
@@ -279,10 +284,10 @@ mod tests {
     fn test_and_query() {
         let query =
             Query::field_eq("name", "Alice").and(Query::numeric_range("age", Some(25.0), Some(40.0)));
-        let sql = SqlTranslator::translate(&query, "data");
+        let sql = SqlTranslator::translate(&query, "payload");
         assert_eq!(
             sql.clause,
-            "(JSON_UNQUOTE(JSON_EXTRACT(data, '$.name')) = ? AND JSON_EXTRACT(data, '$.age') BETWEEN ? AND ?)"
+            "(JSON_UNQUOTE(JSON_EXTRACT(payload, '$.data.name')) = ? AND JSON_EXTRACT(payload, '$.data.age') BETWEEN ? AND ?)"
         );
         assert_eq!(
             sql.params,
@@ -298,30 +303,30 @@ mod tests {
     fn test_or_query() {
         let query =
             Query::field_eq("status", "active").or(Query::field_eq("status", "pending"));
-        let sql = SqlTranslator::translate(&query, "data");
+        let sql = SqlTranslator::translate(&query, "payload");
         assert_eq!(
             sql.clause,
-            "(JSON_UNQUOTE(JSON_EXTRACT(data, '$.status')) = ? OR JSON_UNQUOTE(JSON_EXTRACT(data, '$.status')) = ?)"
+            "(JSON_UNQUOTE(JSON_EXTRACT(payload, '$.data.status')) = ? OR JSON_UNQUOTE(JSON_EXTRACT(payload, '$.data.status')) = ?)"
         );
     }
 
     #[test]
     fn test_not_query() {
         let query = Query::field_eq("deleted", "true").negate();
-        let sql = SqlTranslator::translate(&query, "data");
+        let sql = SqlTranslator::translate(&query, "payload");
         assert_eq!(
             sql.clause,
-            "NOT (JSON_UNQUOTE(JSON_EXTRACT(data, '$.deleted')) = ?)"
+            "NOT (JSON_UNQUOTE(JSON_EXTRACT(payload, '$.data.deleted')) = ?)"
         );
     }
 
     #[test]
     fn test_contains_query() {
         let query = Query::text_search("description", "database");
-        let sql = SqlTranslator::translate(&query, "data");
+        let sql = SqlTranslator::translate(&query, "payload");
         assert_eq!(
             sql.clause,
-            "JSON_UNQUOTE(JSON_EXTRACT(data, '$.description')) LIKE ?"
+            "JSON_UNQUOTE(JSON_EXTRACT(payload, '$.data.description')) LIKE ?"
         );
         assert_eq!(sql.params, vec![SqlParam::Text("%database%".to_string())]);
     }
@@ -329,10 +334,10 @@ mod tests {
     #[test]
     fn test_prefix_query() {
         let query = Query::prefix("email", "admin");
-        let sql = SqlTranslator::translate(&query, "data");
+        let sql = SqlTranslator::translate(&query, "payload");
         assert_eq!(
             sql.clause,
-            "JSON_UNQUOTE(JSON_EXTRACT(data, '$.email')) LIKE ?"
+            "JSON_UNQUOTE(JSON_EXTRACT(payload, '$.data.email')) LIKE ?"
         );
         assert_eq!(sql.params, vec![SqlParam::Text("admin%".to_string())]);
     }
@@ -340,10 +345,10 @@ mod tests {
     #[test]
     fn test_nested_field() {
         let query = Query::field_eq("user.profile.name", "Alice");
-        let sql = SqlTranslator::translate(&query, "data");
+        let sql = SqlTranslator::translate(&query, "payload");
         assert_eq!(
             sql.clause,
-            "JSON_UNQUOTE(JSON_EXTRACT(data, '$.user.profile.name')) = ?"
+            "JSON_UNQUOTE(JSON_EXTRACT(payload, '$.data.user.profile.name')) = ?"
         );
     }
 
@@ -356,11 +361,12 @@ mod tests {
             .and(Query::tags("tags", vec!["rust".to_string()]));
 
         let query = alice_query.or(bob_query);
-        let sql = SqlTranslator::translate(&query, "data");
+        let sql = SqlTranslator::translate(&query, "payload");
 
         // Should be ((name=Alice AND age BETWEEN) OR (name=Bob AND tags CONTAINS))
         assert!(sql.clause.starts_with("(("));
         assert!(sql.clause.contains(" AND "));
         assert!(sql.clause.contains(" OR "));
+        assert!(sql.clause.contains("$.data.name"));
     }
 }

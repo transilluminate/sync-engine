@@ -132,4 +132,11 @@ pub trait ArchiveStore: Send + Sync {
         let _ = (where_clause, params, limit);
         Err(StorageError::Backend("SQL search not supported".into()))
     }
+
+    /// Count items matching a WHERE clause (fast COUNT(*) query).
+    /// Use for exhaustiveness checks without fetching data.
+    async fn count_where(&self, where_clause: &str, params: &[SqlParam]) -> Result<u64, StorageError> {
+        let _ = (where_clause, params);
+        Err(StorageError::Backend("SQL count not supported".into()))
+    }
 }

@@ -204,6 +204,18 @@ impl SearchIndex {
         self
     }
 
+    /// Add a sortable text field with custom JSON path
+    pub fn text_sortable_at(mut self, name: impl Into<String>, json_path: impl Into<String>) -> Self {
+        self.fields.push(SearchField {
+            name: name.into(),
+            json_path: Some(json_path.into()),
+            field_type: SearchFieldType::Text,
+            sortable: true,
+            no_index: false,
+        });
+        self
+    }
+
     /// Add a numeric field
     pub fn numeric(mut self, name: impl Into<String>) -> Self {
         self.fields.push(SearchField {
@@ -281,6 +293,18 @@ impl SearchIndex {
         self.fields.push(SearchField {
             name: name.into(),
             json_path: None,
+            field_type: SearchFieldType::Geo,
+            sortable: false,
+            no_index: false,
+        });
+        self
+    }
+
+    /// Add a geo field with custom JSON path
+    pub fn geo_at(mut self, name: impl Into<String>, json_path: impl Into<String>) -> Self {
+        self.fields.push(SearchField {
+            name: name.into(),
+            json_path: Some(json_path.into()),
             field_type: SearchFieldType::Geo,
             sortable: false,
             no_index: false,
