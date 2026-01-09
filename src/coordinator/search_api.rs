@@ -396,14 +396,14 @@ impl SyncEngine {
     /// Search SQL with a key prefix filter.
     ///
     /// Only items whose `id` starts with the given prefix will be searched.
-    /// This is essential for multi-schema tables where views and crdt items coexist.
+    /// Uses the schema registry to route to the correct table for partitioned schemas.
     pub async fn search_sql_with_prefix(
         &self,
         query: &Query,
         key_prefix: &str,
         limit: usize,
     ) -> Result<Vec<SyncItem>, StorageError> {
-        let l3 = self.l3_store.as_ref().ok_or_else(|| {
+        let sql_store = self.sql_store.as_ref().ok_or_else(|| {
             StorageError::Connection("SQL not available".into())
         })?;
 
@@ -411,6 +411,10 @@ impl SyncEngine {
         let start = std::time::Instant::now();
 
         let sql_query = SqlTranslator::translate(query, "payload");
+        
+        // Determine which table to search based on prefix
+        // For "view:users:" prefix, look up in schema registry
+        let table = self.schema_registry.table_for_key(key_prefix);
         
         // Combine prefix filter with query clause
         let (full_clause, full_params) = if key_prefix.is_empty() {
@@ -422,9 +426,9 @@ impl SyncEngine {
             (format!("id LIKE ? AND ({})", sql_query.clause), params)
         };
         
-        debug!(clause = %full_clause, prefix = %key_prefix, "SQL search");
+        debug!(clause = %full_clause, prefix = %key_prefix, table = %table, "SQL search");
 
-        let results = l3.search(&full_clause, &full_params, limit).await?;
+        let results = sql_store.search_in_table(table, &full_clause, &full_params, limit).await?;
         
         metrics::record_search_query("sql_direct", "success");
         metrics::record_search_latency("sql_direct", start.elapsed());
@@ -449,12 +453,16 @@ impl SyncEngine {
     }
 
     /// Count items matching a query in SQL with a key prefix filter.
+    /// Uses the schema registry to route to the correct table for partitioned schemas.
     pub async fn search_count_sql_with_prefix(&self, query: &Query, key_prefix: &str) -> Result<u64, StorageError> {
-        let l3 = self.l3_store.as_ref().ok_or_else(|| {
+        let sql_store = self.sql_store.as_ref().ok_or_else(|| {
             StorageError::Connection("SQL not available".into())
         })?;
 
         let sql_query = SqlTranslator::translate(query, "payload");
+        
+        // Determine which table to search based on prefix
+        let table = self.schema_registry.table_for_key(key_prefix);
         
         // Combine prefix filter with query clause
         let (full_clause, full_params) = if key_prefix.is_empty() {
@@ -465,9 +473,9 @@ impl SyncEngine {
             (format!("id LIKE ? AND ({})", sql_query.clause), params)
         };
         
-        debug!(clause = %full_clause, prefix = %key_prefix, "SQL count");
+        debug!(clause = %full_clause, prefix = %key_prefix, table = %table, "SQL count");
 
-        l3.count_where(&full_clause, &full_params).await
+        sql_store.count_where_in_table(table, &full_clause, &full_params).await
     }
 
     /// Get search cache statistics.

@@ -684,7 +684,74 @@ impl ArchiveStore for SqlStore {
     }
 
     async fn count_where(&self, where_clause: &str, params: &[SqlParam]) -> Result<u64, StorageError> {
-        let sql = format!("SELECT COUNT(*) as cnt FROM sync_items WHERE {}", where_clause);
+        self.count_where_in_table(crate::schema::DEFAULT_TABLE, where_clause, params).await
+    }
+}
+
+impl SqlStore {
+    /// Search in a specific table using a WHERE clause.
+    pub async fn search_in_table(
+        &self,
+        table: &str,
+        where_clause: &str,
+        params: &[SqlParam],
+        limit: usize,
+    ) -> Result<Vec<SyncItem>, StorageError> {
+        use sqlx::Row;
+        
+        // Validate table name to prevent SQL injection
+        if !table.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Err(StorageError::Backend(format!("Invalid table name: {}", table)));
+        }
+        
+        let sql = format!(
+            "SELECT id, version, timestamp, payload_hash, payload, payload_blob, audit, state, access_count, last_accessed \
+             FROM {} WHERE {} LIMIT {}",
+            table, where_clause, limit
+        );
+        
+        let mut query = sqlx::query(&sql);
+        for param in params {
+            query = match param {
+                SqlParam::Text(s) => query.bind(s.clone()),
+                SqlParam::Numeric(f) => query.bind(*f),
+                SqlParam::Boolean(b) => query.bind(*b),
+            };
+        }
+        
+        let rows = query.fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get("id")
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            
+            // Use get() which already routes to the correct table via registry
+            if let Some(item) = self.get(&id).await? {
+                items.push(item);
+            }
+        }
+        
+        Ok(items)
+    }
+
+    /// Count items in a specific table matching a WHERE clause.
+    pub async fn count_where_in_table(
+        &self,
+        table: &str,
+        where_clause: &str,
+        params: &[SqlParam],
+    ) -> Result<u64, StorageError> {
+        use sqlx::Row;
+        
+        // Validate table name to prevent SQL injection
+        if !table.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Err(StorageError::Backend(format!("Invalid table name: {}", table)));
+        }
+        
+        let sql = format!("SELECT COUNT(*) as cnt FROM {} WHERE {}", table, where_clause);
         
         let mut query = sqlx::query(&sql);
         for param in params {
@@ -704,9 +771,7 @@ impl ArchiveStore for SqlStore {
         
         Ok(count as u64)
     }
-}
 
-impl SqlStore {
     /// Write a single chunk of items to a specific table with content-type aware storage.
     /// The batch_id is already embedded in each item's audit JSON.
     async fn put_batch_chunk_to_table(&self, table: &str, chunk: &[&SyncItem], _batch_id: &str) -> Result<usize, StorageError> {
