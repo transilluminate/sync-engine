@@ -60,10 +60,10 @@ pub struct SearchResult {
 /// Where search results came from
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchSource {
-    /// Results from RediSearch FT.SEARCH
-    Redis,
-    /// Results from SQL query
-    Sql,
+    /// Results from hot tier (RediSearch/Dragonfly)
+    Hot,
+    /// Results from cold tier (SQL/MySQL)
+    Cold,
     /// Results from SearchCache
     Cache,
     /// No results found
@@ -269,7 +269,7 @@ impl SyncEngine {
                 metrics::record_search_results(items.len());
                 Ok(SearchResult {
                     items,
-                    source: SearchSource::Redis,
+                    source: SearchSource::Hot,
                     cached: false,
                 })
             }
@@ -307,7 +307,7 @@ impl SyncEngine {
 
                     Ok(SearchResult {
                         items: sql_results,
-                        source: if is_empty { SearchSource::Empty } else { SearchSource::Sql },
+                        source: if is_empty { SearchSource::Empty } else { SearchSource::Cold },
                         cached: false,
                     })
                 } else {
