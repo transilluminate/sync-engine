@@ -67,7 +67,7 @@ use crate::storage::sql::SqlStore;
 use crate::cuckoo::filter_manager::{FilterManager, FilterTrust};
 use crate::cuckoo::FilterPersistence;
 use crate::batching::hybrid_batcher::{HybridBatcher, BatchConfig, SizedItem};
-use crate::merkle::{RedisMerkleStore, SqlMerkleStore, MerkleBatch};
+use crate::merkle::{MerkleCacheStore, SqlMerkleStore, MerkleBatch};
 use crate::resilience::wal::{WriteAheadLog, MysqlHealthChecker};
 use crate::eviction::tan_curve::{TanCurvePolicy, CacheEntry};
 use crate::schema::SchemaRegistry;
@@ -130,8 +130,8 @@ pub struct SyncEngine {
     /// Hybrid batcher for L2 writes
     pub(super) l2_batcher: Mutex<HybridBatcher<SyncItem>>,
 
-    /// Redis merkle store
-    pub(super) redis_merkle: Option<RedisMerkleStore>,
+    /// Merkle cache (SQL merkle shadow in Redis for fast reads)
+    pub(super) merkle_cache: Option<MerkleCacheStore>,
 
     /// SQL merkle store
     pub(super) sql_merkle: Option<SqlMerkleStore>,
@@ -197,7 +197,7 @@ impl SyncEngine {
             cf_inserts_since_snapshot: AtomicU64::new(0),
             cf_last_snapshot: Mutex::new(Instant::now()),
             l2_batcher: Mutex::new(HybridBatcher::new(batch_config)),
-            redis_merkle: None,
+            merkle_cache: None,
             sql_merkle: None,
             l3_wal: None,
             mysql_health: MysqlHealthChecker::new(),
@@ -329,6 +329,41 @@ impl SyncEngine {
             sql_latency_ms,
             wal_pending_items,
             healthy,
+        }
+    }
+    
+    /// Get the current merkle root hash (ground truth from SQL).
+    /// 
+    /// Returns hex-encoded 32-byte hash, or None if no merkle tree exists.
+    /// Useful for debugging replication sync issues.
+    pub async fn merkle_root(&self) -> Option<String> {
+        if let Some(ref sql_merkle) = self.sql_merkle {
+            match sql_merkle.root_hash().await {
+                Ok(Some(hash)) => Some(hex::encode(hash)),
+                Ok(None) => None,
+                Err(e) => {
+                    warn!(error = %e, "Failed to get merkle root");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    }
+    
+    /// Get merkle root from cache (mirrors SQL, for fast reads).
+    pub async fn merkle_root_cache(&self) -> Option<String> {
+        if let Some(ref merkle_cache) = self.merkle_cache {
+            match merkle_cache.root_hash().await {
+                Ok(Some(hash)) => Some(hex::encode(hash)),
+                Ok(None) => None,
+                Err(e) => {
+                    debug!(error = %e, "Failed to get merkle cache root");
+                    None
+                }
+            }
+        } else {
+            None
         }
     }
     
@@ -688,13 +723,13 @@ impl SyncEngine {
             if let Err(e) = sql_merkle.apply_batch(&merkle_batch).await {
                 error!(error = %e, "Failed to update SQL Merkle tree for deletion");
                 crate::metrics::record_error("L3", "merkle", "batch_apply");
-            }
-        }
-
-        if let Some(ref redis_merkle) = self.redis_merkle {
-            if let Err(e) = redis_merkle.apply_batch(&merkle_batch).await {
-                warn!(error = %e, "Failed to update Redis Merkle tree for deletion");
-                crate::metrics::record_error("L2", "merkle", "batch_apply");
+            } else {
+                // Mirror to cache
+                if let Some(ref merkle_cache) = self.merkle_cache {
+                    if let Err(e) = merkle_cache.sync_affected_from_sql(sql_merkle, &[id.to_string()]).await {
+                        warn!(error = %e, "Failed to sync merkle cache after deletion");
+                    }
+                }
             }
         }
 
@@ -835,7 +870,7 @@ impl SyncEngine {
     /// Returns `(redis_root, sql_root)` as hex strings.
     /// Returns `None` for backends that aren't connected or have empty trees.
     pub async fn merkle_roots(&self) -> (Option<String>, Option<String>) {
-        let redis_root = if let Some(ref rm) = self.redis_merkle {
+        let redis_root = if let Some(ref rm) = self.merkle_cache {
             rm.root_hash().await.ok().flatten().map(hex::encode)
         } else {
             None

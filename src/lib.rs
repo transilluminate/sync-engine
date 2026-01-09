@@ -142,10 +142,11 @@ pub use submit_options::{CacheTtl, OptionsKey, SubmitOptions};
 pub use storage::traits::{CacheStore, ArchiveStore, StorageError};
 pub use cuckoo::filter_manager::{FilterManager, FilterTrust};
 pub use batching::hybrid_batcher::{HybridBatcher, BatchConfig, FlushReason, Batch, FlushBatch, SizedItem, BatchableItem};
-pub use merkle::{PathMerkle, MerkleBatch, MerkleNode, RedisMerkleStore};
+pub use merkle::{PathMerkle, MerkleBatch, MerkleNode, MerkleCacheStore};
 pub use resilience::wal::{WriteAheadLog, MysqlHealthChecker, WalStats};
 pub use resilience::circuit_breaker::{CircuitBreaker, CircuitConfig, CircuitError, BackendCircuits};
 pub use resilience::retry::RetryConfig;
 pub use metrics::LatencyTimer;
 pub use cdc::{CdcEntry, CdcOp, CdcMeta, CdcFieldValue, maybe_compress, maybe_decompress, is_zstd_compressed, cdc_stream_key, CDC_STREAM_SUFFIX};
 pub use schema::{SchemaRegistry, DEFAULT_TABLE};
+

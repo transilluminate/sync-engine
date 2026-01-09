@@ -41,9 +41,16 @@
 //! This is O(diff_size × tree_depth) instead of O(total_items).
 
 mod path_tree;
-mod redis_store;
+mod cache_store;
 mod sql_store;
 
+// Keep redis_store for backwards compatibility during migration
+mod redis_store;
+
 pub use path_tree::{MerkleBatch, MerkleNode, PathMerkle};
-pub use redis_store::RedisMerkleStore;
+pub use cache_store::MerkleCacheStore;
 pub use sql_store::SqlMerkleStore;
+
+// Re-export old name for backwards compatibility
+#[deprecated(since = "0.2.0", note = "Use MerkleCacheStore instead")]
+pub use redis_store::RedisMerkleStore;

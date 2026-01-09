@@ -529,8 +529,8 @@ impl SyncEngine {
         // Extract the path segment from prefix (e.g., "crdt:users:" -> "crdt:users")
         let path = prefix.trim_end_matches(':');
 
-        if let Some(ref redis_merkle) = self.redis_merkle {
-            if let Ok(Some(node)) = redis_merkle.get_node(path).await {
+        if let Some(ref merkle_cache) = self.merkle_cache {
+            if let Ok(Some(node)) = merkle_cache.get_node(path).await {
                 return Some(node.hash.to_vec());
             }
         }

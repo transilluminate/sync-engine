@@ -447,12 +447,14 @@ impl SyncEngine {
         if let Some(ref sql_merkle) = self.sql_merkle {
             if let Err(e) = sql_merkle.apply_batch(&merkle_batch).await {
                 error!(error = %e, "Failed to update SQL Merkle tree for batch deletion");
-            }
-        }
-        
-        if let Some(ref redis_merkle) = self.redis_merkle {
-            if let Err(e) = redis_merkle.apply_batch(&merkle_batch).await {
-                warn!(error = %e, "Failed to update Redis Merkle tree for batch deletion");
+            } else {
+                // Mirror to cache
+                if let Some(ref merkle_cache) = self.merkle_cache {
+                    let deleted_ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
+                    if let Err(e) = merkle_cache.sync_affected_from_sql(sql_merkle, &deleted_ids).await {
+                        warn!(error = %e, "Failed to sync merkle cache after batch deletion");
+                    }
+                }
             }
         }
         

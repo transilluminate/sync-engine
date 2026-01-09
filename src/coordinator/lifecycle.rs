@@ -9,7 +9,7 @@ use tracing::{info, warn, debug, error};
 
 use crate::storage::traits::StorageError;
 use crate::cuckoo::{FilterPersistence, L3_FILTER_ID};
-use crate::merkle::{RedisMerkleStore, SqlMerkleStore, MerkleBatch, PathMerkle};
+use crate::merkle::{MerkleCacheStore, SqlMerkleStore};
 use crate::resilience::wal::WriteAheadLog;
 
 use super::{SyncEngine, EngineState};
@@ -150,11 +150,11 @@ impl SyncEngine {
             crate::metrics::record_startup_phase("wal_drain", phase_start.elapsed());
         }
         
-        // ========== PHASE 4: Get SQL merkle root (trusted root) ==========
+        // ========== PHASE 4: Get SQL merkle root (used to validate snapshots) ==========
         let sql_root: Option<[u8; 32]> = if let Some(ref sql_merkle) = self.sql_merkle {
             match sql_merkle.root_hash().await {
                 Ok(Some(root)) => {
-                    info!(root = %hex::encode(root), "SQL merkle root (ground truth)");
+                    info!(root = %hex::encode(root), "SQL merkle root (for snapshot validation)");
                     Some(root)
                 }
                 Ok(None) => {
@@ -185,18 +185,18 @@ impl SyncEngine {
             info!(url = %redis_url, prefix = ?redis_prefix, "Connecting to Redis (L2 - cache)...");
             match crate::storage::redis::RedisStore::with_prefix(redis_url, redis_prefix.as_deref()).await {
                 Ok(store) => {
-                    let redis_merkle = RedisMerkleStore::with_prefix(
+                    let merkle_cache = MerkleCacheStore::with_prefix(
                         store.connection(),
                         redis_prefix.as_deref(),
                     );
-                    self.redis_merkle = Some(redis_merkle);
+                    self.merkle_cache = Some(merkle_cache);
                     let store = std::sync::Arc::new(store);
                     self.redis_store = Some(store.clone());  // Keep direct reference for CDC
                     self.l2_store = Some(store);
                     tracing::Span::current().record("has_redis", true);
                     crate::metrics::set_backend_healthy("redis", true);
                     crate::metrics::record_startup_phase("redis_connect", phase_start.elapsed());
-                    info!("Redis (L2) connected with merkle shadow tree");
+                    info!("Redis (L2) connected as merkle cache");
                 }
                 Err(e) => {
                     tracing::Span::current().record("has_redis", false);
@@ -210,26 +210,26 @@ impl SyncEngine {
         }
 
         // ========== PHASE 7: Sync Redis with SQL via branch diff ==========
-        if let (Some(ref sql_merkle), Some(ref redis_merkle), Some(ref sql_root)) = 
-            (&self.sql_merkle, &self.redis_merkle, &sql_root) 
+        if let (Some(ref sql_merkle), Some(ref merkle_cache), Some(ref sql_root)) = 
+            (&self.sql_merkle, &self.merkle_cache, &sql_root) 
         {
             let phase_start = std::time::Instant::now();
             let _ = self.state.send(EngineState::SyncingRedis);
             
-            match redis_merkle.root_hash().await {
+            match merkle_cache.root_hash().await {
                 Ok(Some(redis_root)) if &redis_root == sql_root => {
-                    info!("Redis merkle root matches SQL - Redis is in sync");
+                    info!("Redis cache in sync with SQL");
                 }
                 Ok(Some(redis_root)) => {
                     info!(
                         sql_root = %hex::encode(sql_root),
                         redis_root = %hex::encode(redis_root),
-                        "Redis merkle root mismatch - initiating branch diff sync"
+                        "Redis cache stale - syncing from SQL"
                     );
                     
-                    match self.sync_redis_from_sql_diff(sql_merkle, redis_merkle).await {
+                    match self.sync_redis_from_sql_diff(sql_merkle, merkle_cache).await {
                         Ok(synced) => {
-                            info!(items_synced = synced, "Redis sync complete via branch diff");
+                            info!(items_synced = synced, "Redis cache synced from SQL");
                             crate::metrics::record_items_written("L2", synced);
                         }
                         Err(e) => {
@@ -239,7 +239,7 @@ impl SyncEngine {
                     }
                 }
                 Ok(None) => {
-                    info!("Redis merkle tree is empty - will be populated on writes");
+                    info!("Redis cache empty - will populate on writes");
                 }
                 Err(e) => {
                     warn!(error = %e, "Failed to get Redis merkle root - Redis may be stale");
@@ -276,7 +276,7 @@ impl SyncEngine {
                     warn!(error = %e, "Failed to import L3 filter from snapshot");
                 } else {
                     self.l3_filter.mark_trusted();
-                    info!(entries = state.entry_count, "Restored L3 cuckoo filter from snapshot");
+                    info!(entries = state.entry_count, "L3 cuckoo filter valid (snapshot merkle matches SQL)");
                 }
             }
             Ok(Some(_)) => warn!("L3 CF snapshot merkle root mismatch - filter will be rebuilt"),
@@ -289,10 +289,10 @@ impl SyncEngine {
     async fn sync_redis_from_sql_diff(
         &self,
         sql_merkle: &SqlMerkleStore,
-        redis_merkle: &RedisMerkleStore,
+        merkle_cache: &MerkleCacheStore,
     ) -> Result<usize, StorageError> {
         let mut total_synced = 0;
-        let stale_prefixes = self.find_stale_branches(sql_merkle, redis_merkle, "").await?;
+        let stale_prefixes = self.find_stale_branches(sql_merkle, merkle_cache, "").await?;
         
         for prefix in stale_prefixes {
             info!(prefix = %prefix, "Syncing stale branch from SQL to Redis");
@@ -304,19 +304,9 @@ impl SyncEngine {
                 continue;
             }
             
-            let mut merkle_batch = MerkleBatch::new();
-            
             if let Some(ref l3_store) = self.l3_store {
                 for object_id in &leaf_paths {
                     if let Ok(Some(item)) = l3_store.get(object_id).await {
-                        let payload_hash = PathMerkle::payload_hash(&item.content);
-                        let leaf_hash = PathMerkle::leaf_hash(
-                            &item.object_id,
-                            item.version,
-                            &payload_hash,
-                        );
-                        merkle_batch.insert(object_id.clone(), leaf_hash);
-                        
                         if let Some(ref l2_store) = self.l2_store {
                             if let Err(e) = l2_store.put(&item).await {
                                 warn!(id = %object_id, error = %e, "Failed to sync item to Redis");
@@ -326,12 +316,11 @@ impl SyncEngine {
                         }
                     }
                 }
-                
-                if !merkle_batch.is_empty() {
-                    if let Err(e) = redis_merkle.apply_batch(&merkle_batch).await {
-                        warn!(prefix = %prefix, error = %e, "Failed to update Redis merkle");
-                    }
-                }
+            }
+            
+            // Sync merkle cache for these paths
+            if let Err(e) = merkle_cache.sync_affected_from_sql(sql_merkle, &leaf_paths).await {
+                warn!(prefix = %prefix, error = %e, "Failed to sync merkle cache");
             }
         }
         
@@ -342,14 +331,14 @@ impl SyncEngine {
     async fn find_stale_branches(
         &self,
         sql_merkle: &SqlMerkleStore,
-        redis_merkle: &RedisMerkleStore,
+        merkle_cache: &MerkleCacheStore,
         prefix: &str,
     ) -> Result<Vec<String>, StorageError> {
         let mut stale = Vec::new();
         
         let sql_children = sql_merkle.get_children(prefix).await
             .map_err(|e| StorageError::Backend(format!("SQL merkle error: {}", e)))?;
-        let redis_children = redis_merkle.get_children(prefix).await
+        let redis_children = merkle_cache.get_children(prefix).await
             .map_err(|e| StorageError::Backend(format!("Redis merkle error: {}", e)))?;
         
         if sql_children.is_empty() {
@@ -364,7 +353,7 @@ impl SyncEngine {
                         stale.push(child_path);
                     } else {
                         let sub_stale = Box::pin(
-                            self.find_stale_branches(sql_merkle, redis_merkle, &child_path)
+                            self.find_stale_branches(sql_merkle, merkle_cache, &child_path)
                         ).await?;
                         stale.extend(sub_stale);
                     }
@@ -440,6 +429,23 @@ impl SyncEngine {
             debug!(batch_size = batch.items.len(), "Force flushing L2 batch");
             self.flush_batch_internal(batch).await;
         }
+    }
+    
+    /// Log merkle tree diagnostic info (root hash, L3 count).
+    /// 
+    /// Used for debugging replication sync issues.
+    pub async fn log_merkle_diagnostic(&self) {
+        let merkle_root = self.merkle_root().await;
+        let l3_count = self.l3_filter.len();
+        let (l1_items, l1_bytes) = self.l1_stats();
+        
+        debug!(
+            merkle_root = merkle_root.as_deref().unwrap_or("none"),
+            l3_filter_count = l3_count,
+            l1_items = l1_items,
+            l1_bytes = l1_bytes,
+            "sync_engine_state"
+        );
     }
 
     /// Run the main event loop.

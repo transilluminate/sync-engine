@@ -442,6 +442,44 @@ impl SqlMerkleStore {
 
         Ok(count as u64)
     }
+
+    /// Get all nodes from the tree (for cache sync).
+    ///
+    /// Returns (path, hash, children) for each node.
+    pub async fn get_all_nodes(&self) -> Result<Vec<(String, [u8; 32], BTreeMap<String, [u8; 32]>)>, StorageError> {
+        let rows = sqlx::query("SELECT path, merkle_hash FROM merkle_nodes ORDER BY path")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Backend(format!("Failed to get all merkle nodes: {}", e)))?;
+
+        let mut nodes = Vec::with_capacity(rows.len());
+        
+        for row in rows {
+            let path: String = row.try_get("path")
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            
+            let hash_str: String = row.try_get("merkle_hash")
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            
+            let bytes = if hash_str.len() == 64 && hash_str.chars().all(|c| c.is_ascii_hexdigit()) {
+                hex::decode(&hash_str).unwrap_or_else(|_| hash_str.into_bytes())
+            } else {
+                hash_str.into_bytes()
+            };
+            
+            if bytes.len() == 32 {
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&bytes);
+                
+                // Get children for this node
+                let children = self.get_children(&path).await?;
+                
+                nodes.push((path, hash, children));
+            }
+        }
+
+        Ok(nodes)
+    }
 }
 
 #[cfg(test)]

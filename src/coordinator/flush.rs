@@ -328,7 +328,7 @@ impl SyncEngine {
                     processed_ids.push(item.object_id.clone());
                 }
                 
-                // Apply merkle batch to SQL (ground truth) and Redis (cache)
+                // Apply merkle batch to SQL (ground truth), then mirror to cache
                 // Acquire semaphore to limit concurrent SQL merkle writes
                 let mut sql_success = false;
                 if let Some(ref sql_merkle) = self.sql_merkle {
@@ -339,16 +339,18 @@ impl SyncEngine {
                         debug!(merkle_updates = merkle_batch.len(), "SQL merkle tree updated");
                         self.cf_inserts_since_snapshot.fetch_add(merkle_batch.len() as u64, Ordering::Relaxed);
                         sql_success = true;
-                    }
-                }
-                
-                if let Some(ref redis_merkle) = self.redis_merkle {
-                    if let Err(e) = redis_merkle.apply_batch(&merkle_batch).await {
-                        warn!(error = %e, "Failed to update Redis Merkle tree (cache)");
-                        crate::metrics::record_error("merkle", "redis_update", "backend");
-                    } else {
-                        debug!(merkle_updates = merkle_batch.len(), "Redis merkle tree updated");
-                        crate::metrics::record_merkle_operation("redis", "batch_update", true);
+                        
+                        // Mirror affected SQL merkle nodes to Redis cache (targeted sync)
+                        if let Some(ref merkle_cache) = self.merkle_cache {
+                            let affected_paths: Vec<String> = processed_ids.clone();
+                            if let Err(e) = merkle_cache.sync_affected_from_sql(sql_merkle, &affected_paths).await {
+                                warn!(error = %e, "Failed to sync merkle cache from SQL");
+                                crate::metrics::record_error("merkle", "cache_sync", "backend");
+                            } else {
+                                debug!(paths_synced = affected_paths.len(), "Merkle cache synced from SQL");
+                                crate::metrics::record_merkle_operation("cache", "sync_from_sql", true);
+                            }
+                        }
                     }
                 }
                 

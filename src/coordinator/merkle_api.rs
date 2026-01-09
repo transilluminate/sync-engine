@@ -68,8 +68,8 @@ impl SyncEngine {
         }
         
         // Fall back to Redis if no SQL
-        if let Some(ref redis_merkle) = self.redis_merkle {
-            return redis_merkle.get_hash("").await;
+        if let Some(ref merkle_cache) = self.merkle_cache {
+            return merkle_cache.get_hash("").await;
         }
         
         Ok(None)
@@ -91,8 +91,8 @@ impl SyncEngine {
         // Check if Redis shadow is in sync with SQL ground truth
         if self.is_merkle_synced().await? {
             // Fast path: serve from Redis
-            if let Some(ref redis_merkle) = self.redis_merkle {
-                return redis_merkle.get_hash(path).await;
+            if let Some(ref merkle_cache) = self.merkle_cache {
+                return merkle_cache.get_hash(path).await;
             }
         }
         
@@ -114,8 +114,8 @@ impl SyncEngine {
     pub async fn get_merkle_node(&self, path: &str) -> Result<Option<MerkleNode>, StorageError> {
         // Check if Redis shadow is in sync
         if self.is_merkle_synced().await? {
-            if let Some(ref redis_merkle) = self.redis_merkle {
-                return redis_merkle.get_node(path).await;
+            if let Some(ref merkle_cache) = self.merkle_cache {
+                return merkle_cache.get_node(path).await;
             }
         }
         
@@ -144,8 +144,8 @@ impl SyncEngine {
     pub async fn get_merkle_children(&self, path: &str) -> Result<BTreeMap<String, [u8; 32]>, StorageError> {
         // Check if Redis shadow is in sync
         if self.is_merkle_synced().await? {
-            if let Some(ref redis_merkle) = self.redis_merkle {
-                return redis_merkle.get_children(path).await;
+            if let Some(ref merkle_cache) = self.merkle_cache {
+                return merkle_cache.get_children(path).await;
             }
         }
         
@@ -229,8 +229,8 @@ impl SyncEngine {
             return Ok(false);
         };
         
-        let redis_root = if let Some(ref redis_merkle) = self.redis_merkle {
-            redis_merkle.get_hash("").await?
+        let redis_root = if let Some(ref merkle_cache) = self.merkle_cache {
+            merkle_cache.get_hash("").await?
         } else {
             return Ok(false);
         };

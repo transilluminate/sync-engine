@@ -162,6 +162,14 @@ pub struct SyncEngineConfig {
     /// Default: 4 (good balance for most MySQL setups)
     #[serde(default = "default_sql_write_concurrency")]
     pub sql_write_concurrency: usize,
+    
+    /// Merkle diagnostic tick interval in seconds (DEPRECATED, no longer used).
+    /// 
+    /// Cold path logging now provides better visibility into merkle sync state.
+    /// This field is retained for backwards compatibility with existing configs.
+    #[serde(default)]
+    #[deprecated(since = "0.2.0", note = "Merkle tick removed; use cold path logging instead")]
+    pub merkle_log_interval_secs: u64,
 }
 
 fn default_l1_max_bytes() -> usize { 256 * 1024 * 1024 } // 256 MB
@@ -185,6 +193,7 @@ fn default_redis_response_timeout_ms() -> u64 { 5_000 }
 fn default_sql_write_concurrency() -> usize { 4 }
 
 impl Default for SyncEngineConfig {
+    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             redis_url: None,
@@ -213,6 +222,7 @@ impl Default for SyncEngineConfig {
             redis_timeout_ms: default_redis_timeout_ms(),
             redis_response_timeout_ms: default_redis_response_timeout_ms(),
             sql_write_concurrency: default_sql_write_concurrency(),
+            merkle_log_interval_secs: 0,
         }
     }
 }
