@@ -57,7 +57,7 @@ fn install_drivers() {
 }
 
 use std::sync::Arc;
-use crate::schema::SchemaRegistry;
+use crate::schema::{SchemaRegistry, DEFAULT_TABLE};
 
 pub struct SqlStore {
     pool: AnyPool,
@@ -1099,27 +1099,46 @@ impl SqlStore {
     }
     
     /// Mark items as merkle-clean after recalculation.
+    /// 
+    /// Updates all schema-partitioned tables based on the item ID's routing.
     pub async fn mark_merkle_clean(&self, ids: &[String]) -> Result<usize, StorageError> {
         if ids.is_empty() {
             return Ok(0);
         }
         
-        let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
-        let sql = format!(
-            "UPDATE sync_items SET merkle_dirty = 0 WHERE id IN ({})",
-            placeholders.join(", ")
-        );
-        
-        let mut query = sqlx::query(&sql);
+        // Group IDs by their target table
+        let mut ids_by_table: std::collections::HashMap<&'static str, Vec<&String>> = std::collections::HashMap::new();
         for id in ids {
-            query = query.bind(id);
+            let table = self.registry.table_for_key(id);
+            ids_by_table.entry(table).or_default().push(id);
         }
         
-        let result = query.execute(&self.pool)
-            .await
-            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        let mut total_updated = 0usize;
         
-        Ok(result.rows_affected() as usize)
+        for (table, table_ids) in ids_by_table {
+            let placeholders: Vec<&str> = table_ids.iter().map(|_| "?").collect();
+            let sql = format!(
+                "UPDATE {} SET merkle_dirty = 0 WHERE id IN ({})",
+                table,
+                placeholders.join(", ")
+            );
+            
+            let mut query = sqlx::query(&sql);
+            for id in &table_ids {
+                query = query.bind(*id);
+            }
+            
+            match query.execute(&self.pool).await {
+                Ok(result) => {
+                    total_updated += result.rows_affected() as usize;
+                }
+                Err(e) => {
+                    tracing::warn!(table = %table, error = %e, "Failed to mark merkle clean in table");
+                }
+            }
+        }
+        
+        Ok(total_updated)
     }
     
     /// Check if there are any dirty merkle items.
@@ -1189,78 +1208,111 @@ impl SqlStore {
 
     /// Get full SyncItems with merkle_dirty = 1 (need merkle recalculation).
     ///
+    /// Queries all schema-partitioned tables plus the default table.
     /// Returns the items themselves so merkle can be calculated.
     /// Use `mark_merkle_clean()` after processing to clear the flag.
     pub async fn get_dirty_merkle_items(&self, limit: usize) -> Result<Vec<SyncItem>, StorageError> {
-        let rows = sqlx::query(
-            "SELECT id, version, timestamp, payload_hash, payload, payload_blob, audit, state, access_count, last_accessed 
-             FROM sync_items WHERE merkle_dirty = 1 LIMIT ?"
-        )
-            .bind(limit as i64)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| StorageError::Backend(format!("Failed to get dirty merkle items: {}", e)))?;
-        
-        let mut items = Vec::with_capacity(rows.len());
-        for row in rows {
-            let id: String = row.try_get("id")
-                .map_err(|e| StorageError::Backend(e.to_string()))?;
-            let version: i64 = row.try_get("version").unwrap_or(1);
-            let timestamp: i64 = row.try_get("timestamp").unwrap_or(0);
-            let payload_hash: Option<String> = row.try_get("payload_hash").ok();
-            
-            // Handle JSON payload (MySQL returns as bytes, SQLite as string)
-            let payload_bytes: Option<Vec<u8>> = row.try_get("payload").ok();
-            let payload_json: Option<String> = payload_bytes.and_then(|bytes| {
-                String::from_utf8(bytes).ok()
-            });
-            
-            let payload_blob: Option<Vec<u8>> = row.try_get("payload_blob").ok();
-            let audit_bytes: Option<Vec<u8>> = row.try_get("audit").ok();
-            let audit_json: Option<String> = audit_bytes.and_then(|bytes| {
-                String::from_utf8(bytes).ok()
-            });
-            
-            // State field
-            let state_bytes: Option<Vec<u8>> = row.try_get("state").ok();
-            let state: String = state_bytes
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-                .unwrap_or_else(|| "default".to_string());
-            
-            // Access metadata
-            let access_count: i64 = row.try_get("access_count").unwrap_or(0);
-            let last_accessed: i64 = row.try_get("last_accessed").unwrap_or(0);
-            
-            // Determine content and content_type
-            let (content, content_type) = if let Some(ref json_str) = payload_json {
-                (json_str.as_bytes().to_vec(), ContentType::Json)
-            } else if let Some(blob) = payload_blob {
-                (blob, ContentType::Binary)
-            } else {
-                continue; // Skip items with no payload
-            };
-            
-            // Parse audit fields
-            let (batch_id, trace_parent, home_instance_id) = Self::parse_audit_json(audit_json);
-            
-            let item = SyncItem::reconstruct(
-                id,
-                version as u64,
-                timestamp,
-                content_type,
-                content,
-                batch_id,
-                trace_parent,
-                payload_hash.unwrap_or_default(),
-                home_instance_id,
-                state,
-                access_count as u64,
-                last_accessed as u64,
-            );
-            items.push(item);
+        // Get all tables to query (registered tables + default)
+        let mut tables_to_query: Vec<String> = self.registry.tables();
+        if !tables_to_query.contains(&DEFAULT_TABLE.to_string()) {
+            tables_to_query.push(DEFAULT_TABLE.to_string());
         }
         
-        Ok(items)
+        let mut all_items = Vec::new();
+        let per_table_limit = (limit / tables_to_query.len().max(1)).max(100);
+        
+        for table in &tables_to_query {
+            let sql = format!(
+                "SELECT id, version, timestamp, payload_hash, payload, payload_blob, audit, state, access_count, last_accessed 
+                 FROM {} WHERE merkle_dirty = 1 LIMIT ?",
+                table
+            );
+            
+            let rows = match sqlx::query(&sql)
+                .bind(per_table_limit as i64)
+                .fetch_all(&self.pool)
+                .await 
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    // Table might not exist yet - skip it
+                    tracing::debug!(table = %table, error = %e, "Skipping table for dirty merkle query");
+                    continue;
+                }
+            };
+            
+            for row in rows {
+                if let Some(item) = self.row_to_sync_item(&row) {
+                    all_items.push(item);
+                }
+            }
+            
+            // Stop early if we hit the limit
+            if all_items.len() >= limit {
+                break;
+            }
+        }
+        
+        // Truncate to limit
+        all_items.truncate(limit);
+        Ok(all_items)
+    }
+    
+    /// Helper to convert a SQL row to SyncItem.
+    fn row_to_sync_item(&self, row: &sqlx::any::AnyRow) -> Option<SyncItem> {
+        let id: String = row.try_get("id").ok()?;
+        let version: i64 = row.try_get("version").unwrap_or(1);
+        let timestamp: i64 = row.try_get("timestamp").unwrap_or(0);
+        let payload_hash: Option<String> = row.try_get("payload_hash").ok();
+        
+        // Handle JSON payload (MySQL returns as bytes, SQLite as string)
+        let payload_bytes: Option<Vec<u8>> = row.try_get("payload").ok();
+        let payload_json: Option<String> = payload_bytes.and_then(|bytes| {
+            String::from_utf8(bytes).ok()
+        });
+        
+        let payload_blob: Option<Vec<u8>> = row.try_get("payload_blob").ok();
+        let audit_bytes: Option<Vec<u8>> = row.try_get("audit").ok();
+        let audit_json: Option<String> = audit_bytes.and_then(|bytes| {
+            String::from_utf8(bytes).ok()
+        });
+        
+        // State field
+        let state_bytes: Option<Vec<u8>> = row.try_get("state").ok();
+        let state: String = state_bytes
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .unwrap_or_else(|| "default".to_string());
+        
+        // Access metadata
+        let access_count: i64 = row.try_get("access_count").unwrap_or(0);
+        let last_accessed: i64 = row.try_get("last_accessed").unwrap_or(0);
+        
+        // Determine content and content_type
+        let (content, content_type) = if let Some(ref json_str) = payload_json {
+            (json_str.as_bytes().to_vec(), ContentType::Json)
+        } else if let Some(blob) = payload_blob {
+            (blob, ContentType::Binary)
+        } else {
+            return None; // Skip items with no payload
+        };
+        
+        // Parse audit fields
+        let (batch_id, trace_parent, home_instance_id) = Self::parse_audit_json(audit_json);
+        
+        Some(SyncItem::reconstruct(
+            id,
+            version as u64,
+            timestamp,
+            content_type,
+            content,
+            batch_id,
+            trace_parent,
+            payload_hash.unwrap_or_default(),
+            home_instance_id,
+            state,
+            access_count as u64,
+            last_accessed as u64,
+        ))
     }
     
     // ═══════════════════════════════════════════════════════════════════════════

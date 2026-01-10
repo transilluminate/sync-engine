@@ -743,6 +743,78 @@ impl SyncEngine {
         Ok(found)
     }
 
+    /// Delete an item that was replicated from another node.
+    /// 
+    /// Same as `delete()` but does NOT emit CDC events to prevent
+    /// replication loops (A→B→A→B...).
+    /// 
+    /// Use this for items received via replication, not for local deletes.
+    #[tracing::instrument(skip(self), fields(object_id = %id))]
+    pub async fn delete_replicated(&self, id: &str) -> Result<bool, StorageError> {
+        let start = std::time::Instant::now();
+        
+        if !self.should_accept_writes() {
+            crate::metrics::record_operation("engine", "delete_replicated", "rejected");
+            return Err(StorageError::Backend(format!(
+                "Rejecting delete: engine state={}, pressure={}",
+                self.state(),
+                self.pressure()
+            )));
+        }
+
+        let mut found = false;
+
+        // 1. Remove from L1 (immediate)
+        if let Some((_, item)) = self.l1_cache.remove(id) {
+            let size = Self::item_size(&item);
+            self.l1_size_bytes.fetch_sub(size, Ordering::Release);
+            found = true;
+            debug!("Deleted from L1 (replicated)");
+        }
+
+        // 2. Remove from L3 cuckoo filter
+        self.l3_filter.remove(id);
+
+        // 3. Delete from L2 (Redis)
+        if let Some(ref l2) = self.l2_store {
+            if l2.delete(id).await.is_ok() {
+                found = true;
+                debug!("Deleted from L2 (replicated)");
+            }
+        }
+
+        // 4. Delete from L3 (MySQL)
+        if let Some(ref l3) = self.l3_store {
+            if l3.delete(id).await.is_ok() {
+                found = true;
+                debug!("Deleted from L3 (replicated)");
+            }
+        }
+
+        // 5. Update merkle trees with deletion marker
+        let mut merkle_batch = MerkleBatch::new();
+        merkle_batch.delete(id.to_string());
+
+        if let Some(ref sql_merkle) = self.sql_merkle {
+            if let Err(e) = sql_merkle.apply_batch(&merkle_batch).await {
+                error!(error = %e, "Failed to update SQL Merkle tree for replicated deletion");
+            } else {
+                // Mirror to cache
+                if let Some(ref merkle_cache) = self.merkle_cache {
+                    if let Err(e) = merkle_cache.sync_affected_from_sql(sql_merkle, &[id.to_string()]).await {
+                        warn!(error = %e, "Failed to sync merkle cache after replicated deletion");
+                    }
+                }
+            }
+        }
+
+        // NO CDC EMISSION - this is a replicated delete, not a local delete
+
+        debug!(found, "Replicated delete completed");
+        crate::metrics::record_latency("all", "delete_replicated", start.elapsed());
+        Ok(found)
+    }
+
     // --- Internal helpers ---
 
     /// Insert or update an item in L1, correctly tracking size.
